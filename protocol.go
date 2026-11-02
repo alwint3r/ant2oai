@@ -98,6 +98,7 @@ type completionRequest struct {
 	Tools               []functionTool `json:"tools,omitempty"`
 	ToolChoice          any            `json:"tool_choice,omitempty"`
 	ParallelToolCalls   *bool          `json:"parallel_tool_calls,omitempty"`
+	ReasoningEffort     string         `json:"reasoning_effort,omitempty"`
 }
 
 type streamOptions struct {

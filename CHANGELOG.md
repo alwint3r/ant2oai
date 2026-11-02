@@ -6,6 +6,12 @@ Initial implementation. This release introduces the configuration keys and HTTP
 contract described in `README.md`; there is no earlier release to migrate from.
 
 - Translate Anthropic Messages requests to OpenAI Chat Completions.
+- Forward Anthropic `output_config.effort` unchanged as the upstream reasoning
+  effort: `reasoning_effort` in Chat Completions and `reasoning.effort` in
+  ChatGPT mode. Levels are `low`, `medium`, `high`, `xhigh`, and `max`; other
+  values receive HTTP 400. Requests without effort are unchanged. Set
+  `omit_reasoning_effort` (`-omit-reasoning-effort`) for models without
+  reasoning support, which reject the field.
 - Translate normal and streaming responses, with sequential Anthropic content
   blocks for parallel OpenAI function calls.
 - Support client-side tool results, images, and exact model-ID mappings.

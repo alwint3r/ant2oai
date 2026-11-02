@@ -147,6 +147,8 @@ is unconfirmed, disconnect the app in ChatGPT Settings.
   **not enforced in ChatGPT mode**. `temperature` and `top_p` are omitted.
   `token_limit_field`, `stream_usage`, and `omit_sampling` affect API-key mode.
   Requests with `stop_sequences` receive HTTP 400 in ChatGPT mode.
+- `output_config.effort` becomes `reasoning.effort` with the same level.
+  `omit_reasoning_effort` removes it in this mode too.
 - OpenAI reasoning state is omitted when translating back to Messages, so it
   cannot be replayed on the next turn. The full supported text and tool
   history is sent each time. This can affect reasoning continuity and usage.
@@ -326,6 +328,7 @@ Run `./bin/ant2oai -help` for built-in help. Plain `ant2oai` and
 | `-token-limit-field` | `ANT2OAI_TOKEN_LIMIT_FIELD` | `max_tokens` |
 | `-stream-usage` | `ANT2OAI_STREAM_USAGE` | `true` |
 | `-omit-sampling` | `ANT2OAI_OMIT_SAMPLING` | `false` |
+| `-omit-reasoning-effort` | `ANT2OAI_OMIT_REASONING_EFFORT` | `false` |
 | `-timeout` | `ANT2OAI_TIMEOUT` | `10m` |
 | `-upstream-idle-timeout` | `ANT2OAI_UPSTREAM_IDLE_TIMEOUT` | `2m` |
 | `-max-body-bytes` | `ANT2OAI_MAX_BODY_BYTES` | `33554432` (32 MiB) |
@@ -353,6 +356,15 @@ For servers that reject `stream_options`:
 ./bin/ant2oai -stream-usage=false
 ```
 
+For models without reasoning support, or upstreams that reject
+`reasoning_effort`:
+
+```sh
+./bin/ant2oai -omit-reasoning-effort
+```
+
+`omit-reasoning-effort` applies to both API-key and ChatGPT mode.
+
 The proxy makes one upstream inference request per incoming Messages request.
 Inference has no automatic retries or parameter fallback. Claude Code controls
 retries. OAuth renewal and logout can make additional authentication requests.
@@ -374,6 +386,7 @@ Responses equivalents and [additional limits](#chatgpt-specific-limits).
 | Tool history | Assistant `tool_use` and user `tool_result` translated to assistant/tool messages |
 | Parallel tools | Interleaved arguments tracked by upstream index; downstream content blocks stay sequential for Anthropic SDK compatibility |
 | Tool errors | `is_error` represented by a `Tool error: ` text prefix |
+| Effort | `output_config.effort` (`low`, `medium`, `high`, `xhigh`, `max`) forwarded unchanged as `reasoning_effort`; other values receive HTTP 400 |
 | Images | Base64 JPEG/PNG/GIF/WebP or HTTP(S) URLs translated to `image_url` parts |
 | Tool-result images | Tool text retains a marker; images follow all tool replies in a user message with the tool-call ID |
 | Stops | `stop` → `end_turn`, `length` → `max_tokens`, tool calls → `tool_use`, content filters → `refusal` |
@@ -393,9 +406,13 @@ Responses equivalents and [additional limits](#chatgpt-specific-limits).
 - Tool names must contain 1–64 ASCII letters, digits, underscores, or dashes.
   Rename longer MCP tools at their source or use shorter server/tool names.
 - Anthropic `thinking` settings and historical thinking blocks are omitted.
-  The upstream uses its own reasoning defaults. Provider-specific reasoning
-  deltas are ignored. The proxy does not create signed thinking blocks.
-- Prompt-cache markers, metadata, and `output_config.effort` are omitted.
+  Only `output_config.effort` controls upstream reasoning. Without it, the
+  upstream uses its own reasoning defaults. The proxy forwards effort levels
+  without checking model support, so a model that lacks a level, such as
+  `max`, rejects the request. Provider-specific reasoning deltas are ignored.
+  The proxy does not create signed thinking blocks.
+- Prompt-cache markers, metadata, and per-message `output_config.effort` are
+  omitted.
   Upstream automatic prompt caching can still operate. `service_tier: auto`
   is accepted and omitted.
 - Structured output formats, task budgets, context-management requests,

@@ -16,6 +16,11 @@ type responsesRequest struct {
 	Stream            bool                 `json:"stream"`
 	ToolChoice        any                  `json:"tool_choice,omitempty"`
 	ParallelToolCalls *bool                `json:"parallel_tool_calls,omitempty"`
+	Reasoning         *responsesReasoning  `json:"reasoning,omitempty"`
+}
+
+type responsesReasoning struct {
+	Effort string `json:"effort"`
 }
 
 type responsesInputItem struct {
@@ -49,6 +54,9 @@ func translateResponsesRequest(input completionRequest) (responsesRequest, error
 		ParallelToolCalls: input.ParallelToolCalls}
 	if len(input.Stop) != 0 {
 		return result, errors.New("stop_sequences are unsupported in ChatGPT OAuth mode")
+	}
+	if input.ReasoningEffort != "" {
+		result.Reasoning = &responsesReasoning{Effort: input.ReasoningEffort}
 	}
 	if len(input.Tools) != 0 {
 		tools := make([]responsesFunctionTool, 0, len(input.Tools))

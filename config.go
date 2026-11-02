@@ -15,24 +15,25 @@ import (
 )
 
 type config struct {
-	authMode          string
-	authFile          string
-	account           string
-	requestConsent    bool
-	listen            string
-	upstreamBaseURL   string
-	upstreamAPIKey    string
-	proxyAPIKey       string
-	model             string
-	modelMap          map[string]string
-	tokenLimitField   string
-	streamUsage       bool
-	omitSampling      bool
-	requestTimeout    time.Duration
-	upstreamIdle      time.Duration
-	maxBodyBytes      int64
-	maxConcurrent     int
-	requestsPerMinute int
+	authMode            string
+	authFile            string
+	account             string
+	requestConsent      bool
+	listen              string
+	upstreamBaseURL     string
+	upstreamAPIKey      string
+	proxyAPIKey         string
+	model               string
+	modelMap            map[string]string
+	tokenLimitField     string
+	streamUsage         bool
+	omitSampling        bool
+	omitReasoningEffort bool
+	requestTimeout      time.Duration
+	upstreamIdle        time.Duration
+	maxBodyBytes        int64
+	maxConcurrent       int
+	requestsPerMinute   int
 }
 
 func loadConfig(arguments []string, output io.Writer) (config, error) {
@@ -72,6 +73,8 @@ func loadConfig(arguments []string, output io.Writer) (config, error) {
 		"Request stream_options.include_usage (ANT2OAI_STREAM_USAGE)")
 	flags.BoolVar(&cfg.omitSampling, "omit-sampling", false,
 		"Omit temperature and top_p (ANT2OAI_OMIT_SAMPLING)")
+	flags.BoolVar(&cfg.omitReasoningEffort, "omit-reasoning-effort", false,
+		"Omit the reasoning effort taken from output_config.effort (ANT2OAI_OMIT_REASONING_EFFORT)")
 	flags.DurationVar(&cfg.requestTimeout, "timeout", 10*time.Minute,
 		"Total upstream request timeout, including streaming (ANT2OAI_TIMEOUT)")
 	flags.DurationVar(&cfg.upstreamIdle, "upstream-idle-timeout", 2*time.Minute,
@@ -94,6 +97,7 @@ func loadConfig(arguments []string, output io.Writer) (config, error) {
 		{"token-limit-field", "ANT2OAI_TOKEN_LIMIT_FIELD"},
 		{"stream-usage", "ANT2OAI_STREAM_USAGE"},
 		{"omit-sampling", "ANT2OAI_OMIT_SAMPLING"},
+		{"omit-reasoning-effort", "ANT2OAI_OMIT_REASONING_EFFORT"},
 		{"timeout", "ANT2OAI_TIMEOUT"},
 		{"upstream-idle-timeout", "ANT2OAI_UPSTREAM_IDLE_TIMEOUT"},
 		{"max-body-bytes", "ANT2OAI_MAX_BODY_BYTES"},

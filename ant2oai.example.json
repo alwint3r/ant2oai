@@ -8,6 +8,7 @@
   "token_limit_field": "max_tokens",
   "stream_usage": true,
   "omit_sampling": false,
+  "omit_reasoning_effort": false,
   "timeout": "10m",
   "upstream_idle_timeout": "2m",
   "max_body_bytes": 33554432,

@@ -49,10 +49,23 @@ func translateRequest(request messagesRequest, cfg config) (completionRequest, e
 		return result, errors.New("context_management: Extra inputs are not permitted; " +
 			"set CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1")
 	}
+	// Effort: Claude levels are forwarded unchanged as the OpenAI reasoning
+	// effort, including max. A model that lacks a level rejects the request.
+	var reasoningEffort string
 	if output := request.OutputConfig; output != nil {
 		if hasValue(output.Format) || hasValue(output.TaskBudget) {
 			return result, errors.New("output_config format and task_budget are unsupported; " +
 				"set CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1")
+		}
+		if hasValue(output.Effort) {
+			if json.Unmarshal(output.Effort, &reasoningEffort) != nil {
+				return result, errors.New("output_config.effort must be a string")
+			}
+			switch reasoningEffort {
+			case "low", "medium", "high", "xhigh", "max":
+			default:
+				return result, errors.New("output_config.effort must be low, medium, high, xhigh, or max")
+			}
 		}
 	}
 	if request.ServiceTier != "" && request.ServiceTier != "auto" {
@@ -69,6 +82,9 @@ func translateRequest(request messagesRequest, cfg config) (completionRequest, e
 	if !cfg.omitSampling {
 		result.Temperature = request.Temperature
 		result.TopP = request.TopP
+	}
+	if !cfg.omitReasoningEffort {
+		result.ReasoningEffort = reasoningEffort
 	}
 	result.Stop = request.StopSequences
 	if request.Stream && cfg.streamUsage {
