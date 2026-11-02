@@ -1,0 +1,11 @@
+{
+  "listen": "127.0.0.1:8080",
+  "proxy_api_key": "",
+  "auth_mode": "chatgpt",
+  "account": "default",
+  "upstream_base_url": "https://api.openai.com/v1",
+  "model": "your-chatgpt-model-slug",
+  "model_map": {},
+  "timeout": "10m",
+  "upstream_idle_timeout": "2m"
+}

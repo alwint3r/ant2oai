@@ -15,6 +15,10 @@ import (
 )
 
 type config struct {
+	authMode          string
+	authFile          string
+	account           string
+	requestConsent    bool
 	listen            string
 	upstreamBaseURL   string
 	upstreamAPIKey    string
@@ -36,13 +40,24 @@ func loadConfig(arguments []string, output io.Writer) (config, error) {
 	flags := flag.NewFlagSet("ant2oai", flag.ContinueOnError)
 	flags.SetOutput(output)
 	flags.Usage = func() {
-		fmt.Fprintln(output, "Usage: ant2oai [options]")
-		fmt.Fprintln(output, "Translate Anthropic Messages requests to OpenAI Chat Completions.")
-		fmt.Fprintln(output, "Credentials: OPENAI_API_KEY (upstream), ANT2OAI_API_KEY (local proxy).")
+		fmt.Fprintln(output, "Usage: ant2oai [serve|login|login-status|logout|models] [options]")
+		fmt.Fprintln(output, "Translate Anthropic Messages to Chat Completions or ChatGPT Responses.")
+		fmt.Fprintln(output, "Upstream API key: OPENAI_API_KEY.")
+		fmt.Fprintln(output, "Proxy key: ANT2OAI_API_KEY or proxy_api_key in a protected JSON file.")
 		flags.PrintDefaults()
 	}
 
-	var modelMapJSON string
+	var modelMapJSON, configPath string
+	flags.StringVar(&configPath, "config", "",
+		"JSON configuration file (ANT2OAI_CONFIG)")
+	flags.StringVar(&cfg.authMode, "auth-mode", "api-key",
+		"api-key for Chat Completions; chatgpt for OAuth Responses (ANT2OAI_AUTH_MODE)")
+	flags.StringVar(&cfg.authFile, "auth-file", "",
+		"OAuth credential file; default: OS config directory/ant2oai/chatgpt.json (ANT2OAI_AUTH_FILE)")
+	flags.StringVar(&cfg.account, "account", "default",
+		"Saved ChatGPT account label (ANT2OAI_ACCOUNT)")
+	flags.BoolVar(&cfg.requestConsent, "reconsent", false,
+		"Ask for ChatGPT plan permission again during login")
 	flags.StringVar(&cfg.listen, "listen", "127.0.0.1:8080",
 		"HTTP listen address (ANT2OAI_LISTEN)")
 	flags.StringVar(&cfg.upstreamBaseURL, "upstream-base-url", "https://api.openai.com/v1",
@@ -68,8 +83,10 @@ func loadConfig(arguments []string, output io.Writer) (config, error) {
 	flags.IntVar(&cfg.requestsPerMinute, "requests-per-minute", 600,
 		"Global rate limit; burst equals max-concurrent (ANT2OAI_REQUESTS_PER_MINUTE)")
 
-	// Let flag parse both sources so invalid environment values fail at startup.
-	environmentFlags := []struct{ name, environment string }{
+	options := []configOption{
+		{"auth-mode", "ANT2OAI_AUTH_MODE"},
+		{"auth-file", "ANT2OAI_AUTH_FILE"},
+		{"account", "ANT2OAI_ACCOUNT"},
 		{"listen", "ANT2OAI_LISTEN"},
 		{"upstream-base-url", "OPENAI_BASE_URL"},
 		{"model", "OPENAI_MODEL"},
@@ -83,24 +100,51 @@ func loadConfig(arguments []string, output io.Writer) (config, error) {
 		{"max-concurrent", "ANT2OAI_MAX_CONCURRENT"},
 		{"requests-per-minute", "ANT2OAI_REQUESTS_PER_MINUTE"},
 	}
-	for _, entry := range environmentFlags {
-		if value, exists := os.LookupEnv(entry.environment); exists {
-			if err := flags.Set(entry.name, value); err != nil {
-				return cfg, fmt.Errorf("invalid %s", entry.environment)
-			}
-		}
-	}
 	if err := flags.Parse(arguments); err != nil {
 		return cfg, err
 	}
 	if flags.NArg() != 0 {
-		return cfg, errors.New("positional arguments are unsupported; use -help")
+		return cfg, errors.New("put the command before options; use -help")
+	}
+
+	// Parse flags first to select the file, then apply the four precedence levels.
+	commandLine := make(map[string]string)
+	flags.Visit(func(option *flag.Flag) { commandLine[option.Name] = option.Value.String() })
+	if _, explicit := commandLine["config"]; !explicit {
+		configPath = os.Getenv("ANT2OAI_CONFIG")
+	}
+	for _, option := range options {
+		if err := flags.Set(option.name, flags.Lookup(option.name).DefValue); err != nil {
+			return cfg, errors.New("could not restore configuration defaults")
+		}
+	}
+	if configPath != "" {
+		if err := applyJSONConfig(flags, configPath, options, &cfg.proxyAPIKey); err != nil {
+			return cfg, err
+		}
+	}
+	for _, option := range options {
+		if _, explicit := commandLine[option.name]; explicit {
+			continue
+		}
+		if value, exists := os.LookupEnv(option.environment); exists {
+			if err := flags.Set(option.name, value); err != nil {
+				return cfg, fmt.Errorf("invalid %s", option.environment)
+			}
+		}
+	}
+	for name, value := range commandLine {
+		if err := flags.Set(name, value); err != nil {
+			return cfg, fmt.Errorf("invalid -%s", name)
+		}
 	}
 
 	cfg.upstreamAPIKey = os.Getenv("OPENAI_API_KEY")
-	cfg.proxyAPIKey = os.Getenv("ANT2OAI_API_KEY")
-	if strings.ContainsAny(cfg.upstreamAPIKey+cfg.proxyAPIKey, "\r\n") {
-		return cfg, errors.New("API keys must not contain line breaks")
+	if value, exists := os.LookupEnv("ANT2OAI_API_KEY"); exists {
+		cfg.proxyAPIKey = value
+	}
+	if strings.ContainsAny(cfg.upstreamAPIKey+cfg.proxyAPIKey, "\x00\r\n") {
+		return cfg, errors.New("API keys must not contain NUL bytes or line breaks")
 	}
 
 	if err := json.Unmarshal([]byte(modelMapJSON), &cfg.modelMap); err != nil || cfg.modelMap == nil {
@@ -110,6 +154,14 @@ func loadConfig(arguments []string, output io.Writer) (config, error) {
 		if strings.TrimSpace(incoming) == "" || strings.TrimSpace(upstream) == "" {
 			return cfg, errors.New("model-map must contain non-empty model IDs")
 		}
+	}
+
+	if cfg.authMode != "api-key" && cfg.authMode != "chatgpt" {
+		return cfg, errors.New("auth-mode must be api-key or chatgpt")
+	}
+	if strings.TrimSpace(cfg.account) == "" || len(cfg.account) > 64 ||
+		strings.ContainsAny(cfg.account, "\r\n\t") {
+		return cfg, errors.New("account must be a non-empty label of at most 64 bytes without control characters")
 	}
 
 	if cfg.tokenLimitField != "max_tokens" && cfg.tokenLimitField != "max_completion_tokens" {
@@ -140,6 +192,10 @@ func loadConfig(arguments []string, output io.Writer) (config, error) {
 	if strings.HasSuffix(cfg.upstreamBaseURL, "/chat/completions") {
 		return cfg, errors.New("upstream-base-url must end before /chat/completions")
 	}
+	if cfg.authMode == "chatgpt" && cfg.upstreamBaseURL != chatGPTResource {
+		return cfg, errors.New("ChatGPT OAuth requires https://api.openai.com/v1; " +
+			"unset OPENAI_BASE_URL or override upstream-base-url")
+	}
 
 	host, port, err := net.SplitHostPort(cfg.listen)
 	if err != nil {
@@ -150,7 +206,8 @@ func loadConfig(arguments []string, output io.Writer) (config, error) {
 		return cfg, errors.New("listen port must be between 0 and 65535")
 	}
 	if !isLoopbackHost(host) && cfg.proxyAPIKey == "" {
-		return cfg, errors.New("ANT2OAI_API_KEY is required when listening outside loopback")
+		return cfg, errors.New("a proxy key is required when listening outside loopback; " +
+			"set ANT2OAI_API_KEY or JSON proxy_api_key")
 	}
 
 	return cfg, nil

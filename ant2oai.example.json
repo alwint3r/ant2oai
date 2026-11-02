@@ -1,0 +1,16 @@
+{
+  "listen": "127.0.0.1:8080",
+  "proxy_api_key": "",
+  "auth_mode": "api-key",
+  "upstream_base_url": "http://127.0.0.1:8000/v1",
+  "model": "your-tool-capable-model",
+  "model_map": {},
+  "token_limit_field": "max_tokens",
+  "stream_usage": true,
+  "omit_sampling": false,
+  "timeout": "10m",
+  "upstream_idle_timeout": "2m",
+  "max_body_bytes": 33554432,
+  "max_concurrent": 64,
+  "requests_per_minute": 600
+}

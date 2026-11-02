@@ -27,6 +27,7 @@ const downstreamWriteTimeout = 30 * time.Second
 type proxy struct {
 	config config
 	client *http.Client
+	oauth  *oauthSession
 	slots  chan struct{}
 
 	rateMutex     sync.Mutex
@@ -34,7 +35,7 @@ type proxy struct {
 	rateUpdatedAt time.Time
 }
 
-func newProxy(cfg config) *proxy {
+func newUpstreamClient(cfg config) *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.DialContext = (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	transport.TLSHandshakeTimeout = 10 * time.Second
@@ -44,13 +45,17 @@ func newProxy(cfg config) *proxy {
 	transport.MaxIdleConnsPerHost = cfg.maxConcurrent
 	transport.MaxResponseHeaderBytes = 32 << 10
 
+	return &http.Client{
+		Transport: transport,
+		// Refuse every redirect so API credentials stay at the configured URL.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
+	}
+}
+
+func newProxy(cfg config) *proxy {
 	return &proxy{
-		config: cfg,
-		client: &http.Client{
-			Transport: transport,
-			// Refuse every redirect so API credentials stay at the configured URL.
-			CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse },
-		},
+		config:     cfg,
+		client:     newUpstreamClient(cfg),
 		slots:      make(chan struct{}, cfg.maxConcurrent),
 		rateTokens: float64(cfg.maxConcurrent), rateUpdatedAt: time.Now(),
 	}
@@ -87,12 +92,12 @@ func (server *proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request
 
 	if !server.isAuthorized(request) {
 		writeAPIError(writer, http.StatusUnauthorized, "authentication_error",
-			"Invalid proxy credential; set ANTHROPIC_AUTH_TOKEN to ANT2OAI_API_KEY.", requestID)
+			"Invalid proxy credential; set ANTHROPIC_AUTH_TOKEN to the configured proxy key.", requestID)
 		return
 	}
 	if request.URL.Path == "/v1/messages/count_tokens" {
 		writeAPIError(writer, http.StatusNotFound, "not_found_error",
-			"Exact token counting is unavailable for Chat Completions. "+
+			"Exact token counting is unavailable for this upstream. "+
 				"Claude Code can use its local estimate.", requestID)
 		return
 	}
@@ -156,7 +161,17 @@ func (server *proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request
 		writeAPIError(writer, http.StatusBadRequest, "invalid_request_error", err.Error(), requestID)
 		return
 	}
-	payload, err := json.Marshal(translated)
+	var upstreamInput any = translated
+	isChatGPT := server.config.authMode == "chatgpt"
+	if isChatGPT {
+		converted, err := translateResponsesRequest(translated)
+		if err != nil {
+			writeAPIError(writer, http.StatusBadRequest, "invalid_request_error", err.Error(), requestID)
+			return
+		}
+		upstreamInput = converted
+	}
+	payload, err := json.Marshal(upstreamInput)
 	if err != nil {
 		writeAPIError(writer, http.StatusInternalServerError, "api_error",
 			"Could not encode the translated request.", requestID)
@@ -166,6 +181,23 @@ func (server *proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request
 	ctx, cancel := context.WithTimeout(request.Context(), server.config.requestTimeout)
 	defer cancel()
 	upstreamURL := server.config.upstreamBaseURL + "/chat/completions"
+	credential := server.config.upstreamAPIKey
+	// OAuth may renew and persist credentials before starting inference.
+	if isChatGPT {
+		if server.oauth == nil {
+			writeAPIError(writer, http.StatusServiceUnavailable, "api_error",
+				"ChatGPT credentials are unavailable; stop the proxy and run ant2oai login.", requestID)
+			return
+		}
+		credential, err = server.oauth.accessToken(ctx)
+		if err != nil {
+			writer.Header().Set("X-Should-Retry", "false")
+			writeAPIError(writer, http.StatusServiceUnavailable, "api_error", err.Error(), requestID)
+			return
+		}
+		upstreamURL = chatGPTResource + "/responses"
+	}
+
 	upstream, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(payload))
 	if err != nil {
 		writeAPIError(writer, http.StatusInternalServerError, "api_error",
@@ -174,11 +206,11 @@ func (server *proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request
 	}
 	upstream.Header.Set("Content-Type", "application/json")
 	upstream.Header.Set("Accept", "application/json")
-	if input.Stream {
+	if input.Stream || isChatGPT {
 		upstream.Header.Set("Accept", "text/event-stream")
 	}
-	if server.config.upstreamAPIKey != "" {
-		upstream.Header.Set("Authorization", "Bearer "+server.config.upstreamAPIKey)
+	if credential != "" {
+		upstream.Header.Set("Authorization", "Bearer "+credential)
 	}
 
 	// Inbound credentials, beta headers, cookies, and tracing metadata stay local.
@@ -202,14 +234,26 @@ func (server *proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request
 		return
 	}
 	defer response.Body.Close()
+	if isChatGPT {
+		if upstreamID := response.Header.Get("X-Request-Id"); safeUpstreamRequestID(upstreamID) {
+			writer.Header().Set("X-Ant2oai-Upstream-Request-Id", upstreamID)
+		}
+	}
 
 	if response.StatusCode != http.StatusOK {
 		server.writeUpstreamError(writer, response, requestID)
 		return
 	}
-	if input.Stream {
-		contentType, _, _ := mime.ParseMediaType(response.Header.Get("Content-Type"))
-		if contentType != "text/event-stream" {
+	if input.Stream || isChatGPT {
+		reportedContentType := response.Header.Get("Content-Type")
+		contentType, _, _ := mime.ParseMediaType(reportedContentType)
+		// The direct ChatGPT route can omit Content-Type. Accept its SSE with a
+		// missing or text/plain type; the bounded parser still validates completion.
+		isEventStream := contentType == "text/event-stream"
+		if isChatGPT && (reportedContentType == "" || contentType == "text/plain") {
+			isEventStream = true
+		}
+		if !isEventStream {
 			writeAPIError(writer, http.StatusBadGateway, "api_error",
 				"Upstream did not return a text/event-stream response.", requestID)
 			return
@@ -290,6 +334,10 @@ func (server *proxy) admit() bool {
 func (server *proxy) writeUpstreamError(
 	writer http.ResponseWriter, response *http.Response, requestID string,
 ) {
+	if server.config.authMode == "chatgpt" {
+		writeChatGPTUpstreamError(writer, response, requestID)
+		return
+	}
 	status := http.StatusBadGateway
 	errorType := "api_error"
 	message := fmt.Sprintf("Upstream returned HTTP %d. Check its configuration and availability.",
@@ -330,6 +378,11 @@ func (server *proxy) writeUpstreamError(
 		message = "Upstream request timed out."
 	}
 
+	copyRetryHeaders(writer, response)
+	writeAPIError(writer, status, errorType, message, requestID)
+}
+
+func copyRetryHeaders(writer http.ResponseWriter, response *http.Response) {
 	if response.StatusCode != http.StatusUnauthorized && response.StatusCode != http.StatusForbidden {
 		if retry := response.Header.Get("X-Should-Retry"); retry == "true" || retry == "false" {
 			writer.Header().Set("X-Should-Retry", retry)
@@ -348,19 +401,22 @@ func (server *proxy) writeUpstreamError(
 			writer.Header().Set("Retry-After", strconv.Itoa(seconds))
 		}
 	}
-	writeAPIError(writer, status, errorType, message, requestID)
 }
 
 func (server *proxy) serveStream(
 	writer http.ResponseWriter, ctx context.Context, body io.ReadCloser,
 	input messagesRequest, messageID, requestID string,
 ) {
-	writer.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	writer.Header().Set("Cache-Control", "no-cache")
-	writer.Header().Set("X-Accel-Buffering", "no")
-	message := newMessage(input.Model, messageID)
-	if err := writeEvent(writer, messageEvent{Type: "message_start", Message: &message}); err != nil {
-		return
+	// ChatGPT always streams upstream. A non-streaming Messages client receives
+	// one JSON response after the same stream validation has completed.
+	if input.Stream {
+		writer.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		writer.Header().Set("Cache-Control", "no-cache")
+		writer.Header().Set("X-Accel-Buffering", "no")
+		message := newMessage(input.Model, messageID)
+		if err := writeEvent(writer, messageEvent{Type: "message_start", Message: &message}); err != nil {
+			return
+		}
 	}
 
 	readContext, cancelReader := context.WithCancel(ctx)
@@ -381,9 +437,21 @@ func (server *proxy) serveStream(
 	idle := time.NewTimer(server.config.upstreamIdle)
 	defer idle.Stop()
 	translator := newStreamTranslator(input.Tools)
+	var responses *responsesStream
+	if server.config.authMode == "chatgpt" {
+		responses = newResponsesStream(input.Tools)
+	}
 	streamError := func(message string) {
 		slog.Warn("stream failed", "request_id", requestID, "reason", message)
-		writeEvent(writer, messageEvent{Type: "error", Error: &apiError{Type: "api_error", Message: message}})
+		if input.Stream {
+			writeEvent(writer, messageEvent{Type: "error", Error: &apiError{Type: "api_error", Message: message}})
+		} else {
+			status := http.StatusBadGateway
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				status = http.StatusGatewayTimeout
+			}
+			writeAPIError(writer, status, "api_error", message, requestID)
+		}
 	}
 
 	isComplete := false
@@ -398,8 +466,10 @@ func (server *proxy) serveStream(
 			streamError("Upstream stream exceeded the idle timeout.")
 			return
 		case <-pings.C:
-			if err := writeEvent(writer, messageEvent{Type: "ping"}); err != nil {
-				return
+			if input.Stream {
+				if err := writeEvent(writer, messageEvent{Type: "ping"}); err != nil {
+					return
+				}
 			}
 
 		case frame, isOpen := <-frames:
@@ -419,7 +489,7 @@ func (server *proxy) serveStream(
 				}
 			}
 			idle.Reset(server.config.upstreamIdle)
-			if frame.name == "error" {
+			if frame.name == "error" && responses == nil {
 				streamError("Upstream sent a streaming error.")
 				return
 			}
@@ -433,27 +503,54 @@ func (server *proxy) serveStream(
 				continue
 			}
 
-			var chunk completionResponse
-			if checkJSONDepth(data) != nil || json.Unmarshal(data, &chunk) != nil {
-				streamError("Upstream sent an invalid JSON stream event.")
-				return
+			var events []messageEvent
+			var err error
+			if responses != nil {
+				events, err = responses.consume(data, frame.name)
+				isComplete = responses.final != nil
+			} else {
+				var chunk completionResponse
+				if checkJSONDepth(data) != nil || json.Unmarshal(data, &chunk) != nil {
+					streamError("Upstream sent an invalid JSON stream event.")
+					return
+				}
+				events, err = translator.consume(chunk)
 			}
-			events, err := translator.consume(chunk)
 			if err != nil {
 				streamError(err.Error())
 				return
 			}
-			for _, event := range events {
-				if err := writeEvent(writer, event); err != nil {
-					return
+			if input.Stream {
+				for _, event := range events {
+					if err := writeEvent(writer, event); err != nil {
+						return
+					}
 				}
 			}
 		}
 	}
 
-	events, err := translator.finish()
+	var events []messageEvent
+	var err error
+	if responses != nil {
+		events, err = responses.finish()
+	} else {
+		events, err = translator.finish()
+	}
 	if err != nil {
 		streamError(err.Error())
+		return
+	}
+	if !input.Stream {
+		output, err := translateResponse(*responses.final, input, messageID)
+		if err != nil {
+			streamError(err.Error())
+			return
+		}
+		if responses.final.Usage == nil {
+			writer.Header().Set("X-Ant2oai-Usage", "unavailable")
+		}
+		writeJSON(writer, http.StatusOK, output)
 		return
 	}
 	for _, event := range events {

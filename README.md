@@ -1,19 +1,19 @@
 # ant2oai
 
 A small Go proxy for using **Claude Code with an OpenAI-compatible Chat
-Completions server**. It uses the Go standard library and has zero third-party
-Go dependencies.
+Completions server or an eligible ChatGPT account**. It uses the Go standard
+library and has zero third-party Go dependencies.
 
 ```text
-Claude Code  →  POST /v1/messages  →  ant2oai  →  POST /chat/completions
-                  Anthropic format                OpenAI format
+Claude Code → POST /v1/messages → ant2oai ┬→ Chat Completions (API key)
+                                         └→ Public Responses API (ChatGPT OAuth)
 ```
 
 The proxy handles text, streaming, client-side tools, parallel tool calls, and
 images. Your upstream model must support the features you use. Coding-agent
 quality depends on that model's ability to follow instructions and call tools.
 
-## Build and start
+## Build and start with an API key
 
 Requires Go 1.22 or later. From this directory:
 
@@ -39,7 +39,130 @@ This starts the proxy at `http://127.0.0.1:8080`. Keep that terminal open.
 `/chat/completions` to the configured base URL exactly once. A server mounted at
 `/api/v1` therefore needs a base URL ending in `/api/v1`.
 
-Secrets are read from the environment. The proxy does not load `.env` files.
+The upstream API key is read from `OPENAI_API_KEY`. The local proxy key can
+come from `ANT2OAI_API_KEY` or a protected [JSON configuration file](#json-configuration).
+The proxy does not load `.env` files.
+
+## Sign in with ChatGPT
+
+ChatGPT mode uses OpenAI's documented
+[ChatGPT plan usage flow for open-source clients](https://developers.openai.com/siwc/token-sharing-open-source/sign-in).
+OpenAI controls account, workspace, region, model, and integration eligibility.
+A successful identity sign-in can still lack permission for plan-backed
+inference. Review app limits and credit settings at
+[ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
+
+```sh
+make build
+cp ant2oai.chatgpt.example.json ant2oai.chatgpt.json
+
+# Clear overrides left over from an API-key setup.
+unset OPENAI_API_KEY OPENAI_BASE_URL OPENAI_MODEL ANT2OAI_MODEL_MAP ANT2OAI_AUTH_MODE
+export ANT2OAI_API_KEY='your-random-local-proxy-token'
+
+./bin/ant2oai login -config ant2oai.chatgpt.json
+./bin/ant2oai models -config ant2oai.chatgpt.json
+```
+
+Open the printed **Continue with ChatGPT** URL in your browser. Login waits up
+to five minutes for an HTTP callback at `127.0.0.1` on a temporary port. The
+browser must be able to reach that loopback listener; a remote shell requires
+an SSH tunnel for the printed callback port. ant2oai keeps its access and refresh
+tokens in the terminal process and its protected credential file. The browser
+callback contains an authorization code, which is exchanged using PKCE, a
+per-attempt proof key.
+
+Choose a model slug from `models`, replace `your-chatgpt-model-slug` in
+`ant2oai.chatgpt.json`, then start:
+
+```sh
+./bin/ant2oai -config ant2oai.chatgpt.json
+```
+
+Connect Claude Code using the [same local proxy settings below](#connect-claude-code).
+Keep `ENABLE_TOOL_SEARCH=false`. The incoming Claude model IDs are routed by
+`model` and `model_map` in both authentication modes.
+
+Useful commands, with the command placed before its flags:
+
+```sh
+./bin/ant2oai login-status -config ant2oai.chatgpt.json
+
+# Stop the proxy before changing credentials.
+./bin/ant2oai login -config ant2oai.chatgpt.json -reconsent
+./bin/ant2oai logout -config ant2oai.chatgpt.json
+
+# Keep a separate registration for another account or workspace.
+./bin/ant2oai login -config ant2oai.chatgpt.json -account work
+./bin/ant2oai -config ant2oai.chatgpt.json -account work
+```
+
+`login-status` lists saved labels, emails, granted plan permission, and access
+expiry. It reads local state; it does not confirm current OpenAI eligibility.
+To make a label the default, set `account` in the JSON file or
+`ANT2OAI_ACCOUNT`. Up to 32 account registrations can share one credential
+file. Registrations stay separate even when their emails match.
+
+Credentials default to `ant2oai/chatgpt.json` under Go's OS user-config
+directory: `~/Library/Application Support` on macOS, `$XDG_CONFIG_HOME` or
+`~/.config` on Linux, and `%AppData%` on Windows. Override the full file path
+with `auth_file`, `-auth-file`, or `ANT2OAI_AUTH_FILE`. Keep this file outside
+your repository. On Unix, directories created by ant2oai use `0700`, and
+credential files use `0600`. Existing credential files with wider permissions
+are rejected. Windows installations must protect the directory with user-only
+access-control permissions.
+
+The proxy refreshes credentials on demand near access-token expiry. It fetches
+OpenAI's signing keys before exchanging the refresh token. A temporary key-fetch
+failure leaves the existing tokens saved so a later request can retry.
+
+Replacement tokens are saved together. On Unix, the temporary file is synced,
+renamed over the credential file, and followed by a parent-directory sync before
+success is reported. A directory-sync failure is reported even when the new
+file is already visible. Windows syncs the temporary file and uses Go's rename
+operation; atomic replacement and directory-entry durability are not guaranteed.
+
+A `<auth-file>.lock` file allows one proxy or credential-writing command at a
+time. Stop the proxy before `login`, `logout`, or `models`; `login-status` can
+run while it is serving. After a crash, verify the old process has stopped
+before removing its stale `.lock` file. Logout attempts to revoke the refresh
+token, or the access token when no refresh token is saved. It clears local
+tokens and retains the host ID and account/client mapping. If remote revocation
+is unconfirmed, disconnect the app in ChatGPT Settings.
+
+### ChatGPT-specific limits
+
+- Inference uses `POST https://api.openai.com/v1/responses`. Custom upstream
+  base URLs are rejected in ChatGPT mode so OAuth tokens stay at OpenAI.
+- Every upstream inference request uses `store: false` and `stream: true`, with the
+  required history sent in `input`. Non-streaming Messages clients receive a
+  buffered JSON response after stream validation finishes. The direct route can
+  omit `Content-Type`. ant2oai accepts SSE with a missing or `text/plain` header
+  and applies the same stream limits and Responses completion checks.
+- System text becomes developer messages. Functions are supplied through
+  developer `additional_tools` input items. Text, images, tool choices,
+  parallel calls, and tool-result history use the Responses equivalents.
+- OpenAI's direct route rejects output-token caps and sampling parameters.
+  Anthropic `max_tokens` remains required and validated. Its limit is
+  **not enforced in ChatGPT mode**. `temperature` and `top_p` are omitted.
+  `token_limit_field`, `stream_usage`, and `omit_sampling` affect API-key mode.
+  Requests with `stop_sequences` receive HTTP 400 in ChatGPT mode.
+- OpenAI reasoning state is omitted when translating back to Messages, so it
+  cannot be replayed on the next turn. The full supported text and tool
+  history is sent each time. This can affect reasoning continuity and usage.
+- A grant must include `chatgpt.tokens.use.direct` and `resource.invoke`
+  before inference. Use `login -reconsent` to request plan permission again.
+  If the token response omits `scope`, login uses the current authorization
+  request's scopes, as OAuth defines for an unchanged grant. An explicit scope
+  response replaces those scopes. Earlier authorizations supply no fallback.
+  ChatGPT mode never switches to API-key billing after a failure.
+- Confirmed terminal refresh errors clear unusable tokens while retaining the
+  registration. Network and temporary service failures preserve credentials.
+  Stop the proxy and sign in again when the session is expired or revoked.
+
+See OpenAI's [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
+for current route constraints. Live sign-in and inference require your account
+and remain subject to OpenAI's service policy.
 
 ## Connect Claude Code
 
@@ -58,7 +181,8 @@ export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
 claude
 ```
 
-Use the same local token in both terminals. `ANTHROPIC_BASE_URL` must point to
+Set `ANTHROPIC_AUTH_TOKEN` to the proxy key configured through `ANT2OAI_API_KEY`
+or JSON `proxy_api_key`. `ANTHROPIC_BASE_URL` must point to
 the proxy root; Claude Code adds `/v1/messages` itself. Check `/status` inside
 Claude Code to confirm the base URL and credential source. Settings files can
 override your shell environment, so check them if `/status` shows another URL.
@@ -90,8 +214,8 @@ An `error` event means the completion failed after streaming started.
 
 Model selection follows this order:
 
-1. An exact incoming-ID match in `ANT2OAI_MODEL_MAP`.
-2. The fixed model in `OPENAI_MODEL`.
+1. An exact incoming-ID match in `model_map` (`-model-map` or `ANT2OAI_MODEL_MAP`).
+2. The fixed `model` (`-model` or `OPENAI_MODEL`).
 3. The incoming model ID unchanged.
 
 For separate main and background models, choose explicit local aliases:
@@ -103,21 +227,98 @@ export ANT2OAI_MODEL_MAP='{"claude-main":"your-coding-model","claude-small":"you
 # In the Claude Code terminal:
 export ANTHROPIC_MODEL='claude-main'
 export ANTHROPIC_DEFAULT_OPUS_MODEL='claude-main'
-export ANTHROPIC_DEFAULT_SONNET_MODEL='claude-main'
-export ANTHROPIC_DEFAULT_HAIKU_MODEL='claude-small'
+export ANTHROPIC_DEFAULT_SONNET_MODEL='claude-small'
+export ANTHROPIC_DEFAULT_HAIKU_MODEL='claude-tiny'
 ```
 
 Mappings are exact and case-sensitive. There are no wildcard or substring
-matches. If `OPENAI_MODEL` is also set, it remains the fallback for unmapped IDs.
-Restart the proxy after changing its environment.
+matches. If `model` is also set, it remains the fallback for unmapped IDs.
+The configuration precedence below applies to both settings. Restart the
+proxy after changing its configuration.
+
+## JSON configuration
+
+Configuration precedence, from lowest to highest:
+
+1. Built-in defaults.
+2. A JSON file selected by `-config` or `ANT2OAI_CONFIG`.
+3. Environment variables.
+4. Command-line flags.
+
+No configuration file is loaded automatically. `-config` overrides
+`ANT2OAI_CONFIG`; an explicit `-config=` disables file loading. Restart the
+proxy after changing settings.
+
+```sh
+cp ant2oai.example.json ant2oai.json
+# Edit upstream_base_url and model for your provider.
+export ANT2OAI_CONFIG="$PWD/ant2oai.json"
+export OPENAI_API_KEY='your-upstream-api-key'
+export ANT2OAI_API_KEY='your-random-local-proxy-token'
+./bin/ant2oai
+
+# A flag can override one file setting.
+./bin/ant2oai -config ant2oai.json -listen 127.0.0.1:8081
+```
+
+JSON keys match the flags below with underscores replacing dashes.
+`proxy_api_key` is an additional JSON-only string. All keys are optional.
+`model_map` is an object, booleans are JSON booleans, limits are
+integers, and durations are strings such as `"30s"` or `"10m"`. Unknown keys,
+`null`, invalid value types, files larger than 1 MiB, and excessive nesting
+are rejected. Relative file paths use the process working directory. JSON
+paths do not expand `~` or environment variables.
+
+You can include model mappings and the local proxy key in the same file:
+
+```json
+{
+  "model": "your-default-model",
+  "model_map": {
+    "claude-main": "your-coding-model",
+    "claude-small": "your-small-model"
+  },
+  "proxy_api_key": "your-random-local-proxy-token"
+}
+```
+
+Add these fields to your local configuration. Select real upstream model IDs
+or ChatGPT model slugs, and generate a random proxy key. Use the same key as
+Claude Code's `ANTHROPIC_AUTH_TOKEN`. The mapping keys must exactly match the
+model IDs or aliases Claude Code sends.
+
+A file containing a non-empty `proxy_api_key` is a local secret store. On Unix,
+it must be a regular file with no group or other access. Before adding a key,
+protect the file with `chmod 600 ant2oai.json` (use your actual config path).
+On Windows, configure user-only file and directory access-control permissions.
+Keep real keys out of source control and shared directories. The local files
+`ant2oai.json`, `ant2oai.chatgpt.json`, and `examples/config.json` are ignored
+by Git.
+
+`ANT2OAI_API_KEY` overrides `proxy_api_key` whenever the variable is set,
+including an empty value. Unset it to use the file key. `ANT2OAI_MODEL_MAP`
+similarly replaces the entire file mapping when set. Files containing a
+non-empty key still require protected permissions when an environment value
+overrides that key.
+
+The upstream API key remains environment-only through `OPENAI_API_KEY`.
+OAuth tokens use the separate protected credential file. `config` and the
+login-only `reconsent` flag are unavailable as JSON fields. The repository includes
+[`ant2oai.example.json`](ant2oai.example.json) and
+[`ant2oai.chatgpt.example.json`](ant2oai.chatgpt.example.json).
 
 ## Configuration reference
 
-Command-line flags override environment values. Durations use Go syntax such
-as `30s`, `2m`, or `10m`. Run `./bin/ant2oai -help` for built-in help.
+Durations use Go syntax such as `30s`, `2m`, or `10m`.
+Run `./bin/ant2oai -help` for built-in help. Plain `ant2oai` and
+`ant2oai serve` both start the proxy.
 
-| Flag | Environment variable | Default |
+| Flag or JSON-only key | Environment variable | Default |
 | --- | --- | --- |
+| `-config` | `ANT2OAI_CONFIG` | No configuration file |
+| `-auth-mode` | `ANT2OAI_AUTH_MODE` | `api-key`; `chatgpt` selects OAuth Responses |
+| `-auth-file` | `ANT2OAI_AUTH_FILE` | OS config directory + `ant2oai/chatgpt.json` |
+| `-account` | `ANT2OAI_ACCOUNT` | `default` |
 | `-listen` | `ANT2OAI_LISTEN` | `127.0.0.1:8080` |
 | `-upstream-base-url` | `OPENAI_BASE_URL` | `https://api.openai.com/v1` |
 | `-model` | `OPENAI_MODEL` | Pass through incoming model ID |
@@ -130,16 +331,17 @@ as `30s`, `2m`, or `10m`. Run `./bin/ant2oai -help` for built-in help.
 | `-max-body-bytes` | `ANT2OAI_MAX_BODY_BYTES` | `33554432` (32 MiB) |
 | `-max-concurrent` | `ANT2OAI_MAX_CONCURRENT` | `64` |
 | `-requests-per-minute` | `ANT2OAI_REQUESTS_PER_MINUTE` | `600` |
-| Environment only | `OPENAI_API_KEY` | Empty; no upstream Authorization header |
-| Environment only | `ANT2OAI_API_KEY` | Empty; local authentication disabled |
+| `-reconsent` (login only) | — | `false` |
+| Environment only | `OPENAI_API_KEY` | Empty; API-key mode sends no Authorization header |
+| `proxy_api_key` (JSON only) | `ANT2OAI_API_KEY` | Empty; local authentication disabled |
 
 Boolean environment values accept `true` and `false`. Set a false boolean flag
 with `-stream-usage=false` or `-omit-sampling=false`.
 
 ### Provider differences
 
-For OpenAI models that require `max_completion_tokens` and reject sampling
-parameters:
+These flags apply to API-key Chat Completions mode. For OpenAI models that
+require `max_completion_tokens` and reject sampling parameters:
 
 ```sh
 ./bin/ant2oai -token-limit-field=max_completion_tokens -omit-sampling
@@ -151,10 +353,14 @@ For servers that reject `stream_options`:
 ./bin/ant2oai -stream-usage=false
 ```
 
-The proxy makes one upstream request per incoming request. It performs no
-automatic retries or parameter fallback. Claude Code controls retries.
+The proxy makes one upstream inference request per incoming Messages request.
+Inference has no automatic retries or parameter fallback. Claude Code controls
+retries. OAuth renewal and logout can make additional authentication requests.
 
 ## Compatibility
+
+The table describes API-key Chat Completions mode. ChatGPT mode uses the
+Responses equivalents and [additional limits](#chatgpt-specific-limits).
 
 | Capability | Behavior |
 | --- | --- |
@@ -177,8 +383,9 @@ automatic retries or parameter fallback. Claude Code controls retries.
 
 ### Limits and unsupported features
 
-- The upstream must implement **Chat Completions**. Responses API-only servers,
-  Bedrock signing, Vertex authentication, and Azure-specific `api-key`
+- API-key upstreams must implement **Chat Completions**. ChatGPT OAuth uses
+  the public Responses API with the restrictions above. Generic Responses-only
+  servers, Bedrock signing, Vertex authentication, and Azure-specific `api-key`
   authentication are outside this implementation.
 - Set `ENABLE_TOOL_SEARCH=false`. Anthropic server-managed tools, deferred
   tools, and `tool_reference` blocks receive HTTP 400. Claude Code's own local
@@ -205,32 +412,38 @@ automatic retries or parameter fallback. Claude Code controls retries.
   `message_delta`. These values are never presented as tokenizer estimates.
 - OpenAI does not identify which stop string matched. The proxy returns
   `stop_sequence: null` and maps a normal `stop` finish to `end_turn`.
-- Model discovery (`/v1/models`) and Anthropic account/billing endpoints are
-  unavailable. Use explicit model aliases if needed.
+- The proxy's HTTP API omits model discovery (`/v1/models`) and Anthropic
+  account/billing endpoints. The `models` CLI command lists account-specific
+  ChatGPT models. Use explicit model aliases in Claude Code if needed.
 - Every tool's arguments must finish as a JSON object. Invalid or interrupted
   tool arguments produce an error. Streaming failures never emit a successful
-  `message_stop`. A clean EOF after an upstream finish reason is accepted;
-  EOF before that finish reason is an error.
+  `message_stop`. Chat Completions accepts clean EOF only after an upstream
+  finish reason. ChatGPT mode requires `response.completed` or a supported
+  `response.incomplete` event.
 
 ## Security and resource limits
 
 The proxy binds to loopback by default. Local authentication is optional on
 loopback; enabling it is recommended on shared machines. Other listen
-addresses require `ANT2OAI_API_KEY`. Both `Authorization: Bearer ...` and
+addresses require a proxy key from `ANT2OAI_API_KEY` or JSON `proxy_api_key`.
+Both `Authorization: Bearer ...` and
 `x-api-key: ...` are accepted for local authentication.
 
-The upstream credential comes exclusively from `OPENAI_API_KEY`. Inbound
-credentials, cookies, beta headers, and tracing headers are never forwarded.
+API-key mode reads its upstream credential from `OPENAI_API_KEY`. ChatGPT
+mode reads its selected saved OAuth token set. Inbound credentials, cookies,
+beta headers, and tracing headers are never forwarded.
 Upstream redirects are refused. Logs include generated request IDs, status,
-duration, and safe stream errors. Request bodies, response bodies, and API keys
-are excluded. Upstream error bodies are replaced by safe messages because
+duration, and safe stream errors. Request bodies, response bodies, API keys,
+and OAuth tokens are excluded. Upstream error bodies are replaced by safe messages because
 providers may include credentials or prompt fragments in them.
 
 Incoming HTTP has no TLS. Use a trusted TLS reverse proxy or an SSH tunnel
 for connections across machines. Keep the upstream on HTTPS or a trusted local
 network. Standard Go `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` behavior applies
 to outgoing requests. A configured network proxy is part of your trust boundary.
-The process has no persistence, analytics, provider SDK, or background model calls.
+The proxy has no analytics, provider SDK, or background model calls. ChatGPT
+mode persists OAuth registrations and tokens. Conversation bodies are held
+only for request translation and validation; ant2oai does not save them.
 
 Inference admission is process-wide: a token bucket refills at the configured
 requests per minute, with a burst equal to `max-concurrent`. Active requests
@@ -246,7 +459,9 @@ Additional bounds:
 - Upstream response headers and streaming idle: configurable, 2 minutes by default.
 - Total upstream request: configurable, 10 minutes by default; covers body reads.
 - Idle upstream connections: closed after 90 seconds.
-- Upstream JSON response or total SSE input: 64 MiB.
+- Upstream inference JSON response or total SSE input: 64 MiB.
+- OAuth metadata, signing keys, and token JSON responses: 256 KiB.
+- ChatGPT model-catalog JSON: 8 MiB, including instruction and capability metadata.
 - One SSE event: 2 MiB. One tool's arguments: 8 MiB.
 - Tool calls per response/message: 128. Downstream content blocks per stream: 1024.
 - Downstream writes: 30 seconds per event or JSON response.
@@ -257,7 +472,10 @@ parallel calls and any text after tool use are buffered until the upstream
 finishes. This keeps downstream content blocks sequential for Anthropic SDK
 callbacks. All tool arguments are retained for validation within the limits
 above. A downstream disconnect cancels the upstream request. `SIGINT` and
-`SIGTERM` allow active requests 15 seconds to finish, then cancel them.
+`SIGTERM` allow active requests 15 seconds to finish, then cancel them. OAuth
+renewal gets up to five extra seconds to finish credential writes. If it cannot
+finish, the process retains its lock file; verify the process has stopped
+before removing that stale lock.
 
 Pointing Claude Code at this proxy changes its model-request route. Claude Code
 can also make other network requests. Set
@@ -270,7 +488,10 @@ every network feature, including the WebFetch domain safety check.
 | Symptom | Check |
 | --- | --- |
 | Local HTTP 401 | Use the proxy token as `ANTHROPIC_AUTH_TOKEN`; check `/status` for settings overrides |
-| Upstream authentication failure | Check `OPENAI_API_KEY` and upstream model permissions |
+| Upstream authentication failure | In API-key mode, check `OPENAI_API_KEY`; in ChatGPT mode, check `login-status`, plan scopes, and workspace policy |
+| ChatGPT sign-in succeeds but plan usage is disabled | Stop the proxy and run `login -reconsent`; check OpenAI eligibility and ChatGPT app permissions |
+| Credential file is locked | Stop the process using it; remove a stale `.lock` only after verifying that process has stopped |
+| ChatGPT HTTP 403 or 429 | Check the safe upstream error code and ChatGPT Settings → Usage; an app-specific restriction or limit can apply |
 | Upstream endpoint/model missing | Check the `/v1` or other API prefix in `OPENAI_BASE_URL`, then the selected model |
 | Upstream rejects the request | Check tool support, model output/context limits, token-limit field, and sampling restrictions |
 | Tool search or beta-field HTTP 400 | Set the two compatibility variables in the Claude Code example and start a new session |
@@ -280,8 +501,13 @@ every network feature, including the WebFetch domain safety check.
 | Local HTTP 429 | Reduce parallel agents or adjust the local admission limits |
 
 The `request-id` response header links a failure to the proxy's completion log.
-The proxy deliberately excludes raw provider error messages. Check the upstream
-server's own diagnostics when a safe error message needs more context.
+The proxy deliberately excludes raw provider error messages. In ChatGPT mode,
+HTTP error statuses are preserved. `X-Ant2oai-Upstream-Status`, an allowlisted
+`X-Ant2oai-Upstream-Code`, and a validated `X-Ant2oai-Upstream-Request-Id`
+provide safe diagnostics when available. Bodies shaped as `detail` receive a
+generic message. Check the upstream server's diagnostics or provide the safe
+request ID to OpenAI when more context is needed. Temporary failures do not
+trigger a billing-mode fallback.
 
 ## Development
 
@@ -294,7 +520,9 @@ go test -race ./...
 ```
 
 The repository currently has no test files. Follow `AGENTS.md` before adding
-tests. `main.go` owns process lifetime, `config.go` loads configuration,
-`server.go` handles HTTP and admission, and `protocol.go` defines wire types.
-The request, response, and stream translation files contain the protocol logic.
-The stream translator can consume parsed chunks independently of HTTP.
+tests. `main.go` owns process lifetime, `config.go` and `config_file.go` load
+configuration, and `server.go` handles HTTP and admission. The request,
+response, and stream translation files contain the Chat Completions protocol
+logic; `responses.go` adapts the ChatGPT Responses protocol. The `oauth*.go`
+files handle login, ID-token verification, protected storage, and renewal.
+Stream translation runs independently of HTTP.

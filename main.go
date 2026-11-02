@@ -18,6 +18,13 @@ func main() {
 }
 
 func run(arguments []string) int {
+	command := "serve"
+	if len(arguments) > 0 {
+		switch arguments[0] {
+		case "serve", "login", "login-status", "logout", "models":
+			command, arguments = arguments[0], arguments[1:]
+		}
+	}
 	cfg, err := loadConfig(arguments, os.Stderr)
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
@@ -27,14 +34,41 @@ func run(arguments []string) int {
 		return 2
 	}
 
+	if cfg.requestConsent && command != "login" {
+		slog.Error("-reconsent is available only with the login command")
+		return 2
+	}
+	if command != "serve" {
+		if err := runAuthCommand(command, cfg, os.Stdout); err != nil {
+			slog.Error("ChatGPT command failed", "reason", err.Error())
+			return 1
+		}
+		return 0
+	}
+
+	application := newProxy(cfg)
+	defer application.client.CloseIdleConnections()
+	if cfg.authMode == "chatgpt" {
+		application.oauth, err = openOAuthSession(cfg, application.client)
+		if err != nil {
+			slog.Error("could not load ChatGPT session", "reason", err.Error())
+			return 1
+		}
+		defer func() {
+			cleanupContext, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancelCleanup()
+			if err := application.oauth.close(cleanupContext); err != nil {
+				slog.Warn("could not remove credential lock", "reason", err.Error())
+			}
+		}()
+		slog.Info("using saved ChatGPT account", "account", cfg.account)
+	}
+
 	listener, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
 		slog.Error("could not open listener", "reason", err.Error())
 		return 1
 	}
-
-	application := newProxy(cfg)
-	defer application.client.CloseIdleConnections()
 
 	// Keep requests alive during the graceful shutdown period after a signal.
 	requestContext, cancelRequests := context.WithCancel(context.Background())
@@ -56,7 +90,7 @@ func run(arguments []string) int {
 
 	slog.Info("proxy listening", "address", listener.Addr().String())
 	if cfg.proxyAPIKey == "" {
-		slog.Warn("local authentication is disabled; set ANT2OAI_API_KEY to require a proxy credential")
+		slog.Warn("local authentication is disabled; set ANT2OAI_API_KEY or JSON proxy_api_key")
 	}
 
 	select {

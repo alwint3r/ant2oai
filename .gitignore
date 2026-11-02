@@ -1,4 +1,7 @@
 /bin/
 /.env
 /.env.*
+/ant2oai.json
+/ant2oai.chatgpt.json
+/examples/config.json
 .DS_Store

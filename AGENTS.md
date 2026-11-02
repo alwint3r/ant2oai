@@ -24,8 +24,9 @@ for performance.
 ## 1. Project context
 
 - **Purpose:** an HTTP proxy that accepts Anthropic Messages API requests and
-  sends them to an OpenAI Chat Completions API upstream. It translates the
-  responses, including streaming responses, back to the Anthropic format.
+  sends them to an OpenAI Chat Completions API upstream or to the public
+  Responses API with ChatGPT OAuth. It translates the responses, including
+  streaming responses, back to the Anthropic format.
 - **Language:** Go. `go.mod` declares `go 1.22`, so the code must compile with
   Go 1.22. A newer local toolchain can accept language features and standard
   library APIs that Go 1.22 lacks, so check the Go version before you use one.
@@ -44,10 +45,18 @@ for performance.
   exported names, and initialisms in one case (`upstreamURL`, `requestID`).
 
 Configuration and compatibility are documented in `README.md`. `main.go` owns
-process lifetime, `config.go` loads settings, `server.go` owns HTTP I/O and
-admission, and `protocol.go` defines wire types. `translate_request.go`,
-`translate_response.go`, and `stream.go` contain protocol translation. The
-stream translator accepts parsed chunks independently of network I/O.
+process lifetime, `config.go` and `config_file.go` load settings, `server.go`
+owns HTTP I/O and admission, and `protocol.go` defines Messages and Chat
+Completions wire types. `translate_request.go`, `translate_response.go`, and
+`stream.go` contain their protocol translation. `responses.go` adapts the
+ChatGPT Responses protocol. Stream translators accept parsed chunks or events
+independently of network I/O. `oauth.go` owns login commands, `oauth_oidc.go`
+verifies ID tokens, `oauth_session.go` owns token renewal, and `oauth_store.go`
+owns protected credential files and process locks. OAuth tokens must only go to
+the discovered OpenAI auth endpoints and https://api.openai.com/v1.
+JSON configuration may store a local proxy key in `proxy_api_key`. Such files
+are local secret stores and require owner-only permissions on Unix. Keep real
+keys out of committed examples and configuration.
 
 ---
 
