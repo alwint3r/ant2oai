@@ -200,6 +200,9 @@ background requests, to your chosen upstream model. Claude Code continues to
 use its requested model ID in the response. This preserves its client-side
 model selection. The actual model is determined by the mapping below.
 
+For privacy controls and connections that bypass ant2oai, see
+[Claude Code traffic outside the proxy](#claude-code-traffic-outside-the-proxy).
+
 ### Claude Code auto mode
 
 [Auto mode](https://code.claude.com/docs/en/permission-modes#eliminate-prompts-with-auto-mode)
@@ -537,11 +540,99 @@ renewal gets up to five extra seconds to finish credential writes. If it cannot
 finish, the process retains its lock file; verify the process has stopped
 before removing that stale lock.
 
-Pointing Claude Code at this proxy changes its model-request route. Claude Code
-can also make other network requests. Set
-`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` if you want to suppress its optional
-traffic; this also disables automatic updates. That variable does not cover
-every network feature, including the WebFetch domain safety check.
+### Claude Code traffic outside the proxy
+
+`ANTHROPIC_BASE_URL` routes Claude Code's model API requests, including the
+client-side auto-mode classifier calls observed in our local check. Claude Code
+also has separate network paths that can contact Anthropic and other services.
+The auto-mode and experimental-beta variables in the connection example control
+request compatibility. Telemetry has its own controls.
+
+Depending on the Claude Code version, authentication, settings, and enabled
+features, these separate paths can include:
+
+| Traffic | Separate destinations or behavior |
+| --- | --- |
+| Usage metrics | Anthropic and Datadog endpoints |
+| Feature-flag evaluation | `api.anthropic.com` |
+| WebFetch domain safety checks | Requested hostnames sent to `api.anthropic.com` |
+| Authentication and account operations | `claude.ai`, `platform.claude.com`, and related sign-in hosts |
+| Version checks and updates | Distribution endpoints such as `downloads.claude.ai` |
+| Feedback submissions | Reports to Anthropic can include conversation history and code |
+| Plugins, MCP servers, and tools | Their configured services and download hosts |
+
+These requests bypass ant2oai's model-request route and may still use a
+configured HTTP proxy. ant2oai's logs cover requests that reach ant2oai. Use
+system-level network monitoring to inspect Claude Code's other connections.
+
+Anthropic describes routine metrics as latency, reliability, and usage data,
+with code, prompts, and file paths excluded. Feedback submissions have their
+own content-sharing behavior. The destinations and controls here come from
+Anthropic's published documentation; this project has not performed a full
+live-session traffic audit. Review the upstream guidance after Claude Code
+updates:
+
+- [Traffic outside the gateway path](https://code.claude.com/docs/en/llm-gateway-connect#turn-off-traffic-outside-the-gateway-path)
+- [Telemetry and data usage](https://code.claude.com/docs/en/data-usage#telemetry-services)
+- [Network access requirements](https://code.claude.com/docs/en/network-config#network-access-requirements)
+
+#### Disable telemetry and feedback while keeping automatic updates
+
+In the Claude Code terminal, before starting a new session:
+
+```sh
+unset CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
+export DISABLE_TELEMETRY=1
+export DISABLE_ERROR_REPORTING=1
+export DISABLE_FEEDBACK_COMMAND=1
+```
+
+If `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` is also set in a Claude Code
+settings file, remove that entry to retain automatic updates.
+`DISABLE_TELEMETRY` also disables feature-flag fetching and session quality
+surveys. Features that depend on feature flags can become unavailable.
+
+#### Disable nonessential background traffic
+
+For the broader opt-out, set this before starting a new Claude Code session:
+
+```sh
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+```
+
+This disables telemetry, error reporting, feedback, feature-flag fetching, and
+several background checks. **It also disables automatic updates.** Arrange
+regular manual updates when using it. WebFetch safety checks, official plugin
+marketplace auto-install, and tool or MCP network access have separate controls.
+
+#### WebFetch domain safety checks
+
+Before fetching a URL, WebFetch can send its hostname to `api.anthropic.com`
+for a domain-blocklist check. Anthropic documents the payload as the hostname
+alone, with the full URL, path, and page contents excluded. This check runs
+across model providers and remains active when nonessential traffic is disabled.
+
+To prevent this connection, disable WebFetch or merge the following root-level
+field into Claude Code's `~/.claude/settings.json`:
+
+```json
+{
+  "skipWebFetchPreflight": true
+}
+```
+
+This removes the domain-blocklist check. Combine it with
+[WebFetch domain permission rules](https://code.claude.com/docs/en/permissions#webfetch)
+when you need to restrict which hosts the tool can reach.
+
+#### Enforce outbound network access
+
+For enforced destination restrictions, use process-level firewall rules or
+container network policies. Allow Claude Code to reach the local proxy and
+explicitly approved tool destinations. Give the separate ant2oai process access
+to its configured upstream and, in ChatGPT mode, the required OpenAI
+authentication endpoints. Verify the policy with network monitoring after
+configuration changes and Claude Code upgrades.
 
 ## Troubleshooting
 

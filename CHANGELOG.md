@@ -16,6 +16,9 @@ contract described in `README.md`; there is no earlier release to migrate from.
   Raw request data and provider errors remain excluded. Give `safeguards`
   rejections an explicit server-side auto-mode compatibility hint, and document
   client-side classifier routing and safety limits.
+- Document Claude Code traffic outside `ANTHROPIC_BASE_URL`, telemetry and
+  feedback controls, automatic-update effects, the WebFetch safety-check
+  exception, and process-level outbound network restrictions.
 - Forward Anthropic `output_config.effort` unchanged as the upstream reasoning
   effort: `reasoning_effort` in Chat Completions and `reasoning.effort` in
   ChatGPT mode. Levels are `low`, `medium`, `high`, `xhigh`, and `max`; other
