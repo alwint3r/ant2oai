@@ -6,6 +6,16 @@ Initial implementation. This release introduces the configuration keys and HTTP
 contract described in `README.md`; there is no earlier release to migrate from.
 
 - Translate Anthropic Messages requests to OpenAI Chat Completions.
+- Support `stop_sequences` in non-streaming ChatGPT Messages requests, including
+  Claude Code's client-side auto-mode classifier calls. Match the earliest
+  marker after full response validation and return the matched stop sequence.
+  Upstream generation and token usage still cover the full reply. Refusals stay
+  intact. Streaming ChatGPT stop-sequence requests continue to receive HTTP 400.
+- Add safe HTTP failure reasons and proxy/upstream error sources to completion
+  logs. Return `X-Ant2oai-Upstream-Status` for API-key upstream HTTP errors too.
+  Raw request data and provider errors remain excluded. Give `safeguards`
+  rejections an explicit server-side auto-mode compatibility hint, and document
+  client-side classifier routing and safety limits.
 - Forward Anthropic `output_config.effort` unchanged as the upstream reasoning
   effort: `reasoning_effort` in Chat Completions and `reasoning.effort` in
   ChatGPT mode. Levels are `low`, `medium`, `high`, `xhigh`, and `max`; other

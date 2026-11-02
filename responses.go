@@ -52,9 +52,13 @@ func translateResponsesRequest(input completionRequest) (responsesRequest, error
 	result := responsesRequest{Model: input.Model, Store: false, Stream: true,
 		Input: make([]responsesInputItem, 0), ToolChoice: input.ToolChoice,
 		ParallelToolCalls: input.ParallelToolCalls}
-	if len(input.Stop) != 0 {
-		return result, errors.New("stop_sequences are unsupported in ChatGPT OAuth mode")
+	// The direct route has no stop parameter. Buffered Messages replies apply
+	// stops locally after the upstream stream has completed and passed validation.
+	if len(input.Stop) != 0 && input.Stream {
+		return result, errors.New("stop_sequences require stream: false in ChatGPT OAuth mode; " +
+			"streaming stop sequences are unsupported")
 	}
+
 	if input.ReasoningEffort != "" {
 		result.Reasoning = &responsesReasoning{Effort: input.ReasoningEffort}
 	}
@@ -115,6 +119,45 @@ func translateResponsesRequest(input completionRequest) (responsesRequest, error
 			})
 		}
 	}
+	return result, nil
+}
+
+func translateResponsesMessage(
+	response completionResponse, request messagesRequest, messageID string,
+) (messageResponse, error) {
+	// Validate the full reply before trimming, including any tool calls after
+	// a stop marker.
+	result, err := translateResponse(response, request, messageID)
+	if err != nil || len(request.StopSequences) == 0 {
+		return result, err
+	}
+
+	// Refusals retain their full text and stop reason.
+	message := response.Choices[0].Message
+	if message.Content == nil || message.Refusal != "" || *result.StopReason == "refusal" {
+		return result, nil
+	}
+	text := *message.Content
+	stopAt := len(text)
+	matched := ""
+	for _, sequence := range request.StopSequences {
+		position := strings.Index(text, sequence)
+		if position >= 0 && (matched == "" || position < stopAt) {
+			stopAt = position
+			matched = sequence
+		}
+	}
+	if matched == "" {
+		return result, nil
+	}
+
+	// The translated reply places text before tool calls. Everything from the
+	// first marker onward is omitted. Usage keeps the full upstream token counts.
+	truncated := text[:stopAt]
+	stopReason := "stop_sequence"
+	result.Content = []outputBlock{{Type: "text", Text: &truncated}}
+	result.StopReason = &stopReason
+	result.StopSequence = &matched
 	return result, nil
 }
 

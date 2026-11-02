@@ -146,7 +146,12 @@ is unconfirmed, disconnect the app in ChatGPT Settings.
   Anthropic `max_tokens` remains required and validated. Its limit is
   **not enforced in ChatGPT mode**. `temperature` and `top_p` are omitted.
   `token_limit_field`, `stream_usage`, and `omit_sampling` affect API-key mode.
-  Requests with `stop_sequences` receive HTTP 400 in ChatGPT mode.
+- Non-streaming Messages requests support `stop_sequences` through local
+  matching after the full upstream stream passes validation. The proxy returns
+  text before the earliest match, `stop_reason: "stop_sequence"`, and the
+  matched `stop_sequence`. Upstream generation still finishes in full, and
+  usage includes that full reply. Refusals retain their full text and stop
+  reason. Streaming Messages requests with `stop_sequences` receive HTTP 400.
 - `output_config.effort` becomes `reasoning.effort` with the same level.
   `omit_reasoning_effort` removes it in this mode too.
 - OpenAI reasoning state is omitted when translating back to Messages, so it
@@ -179,6 +184,7 @@ export ANTHROPIC_BASE_URL='http://127.0.0.1:8080'
 export ANTHROPIC_AUTH_TOKEN='your-random-local-proxy-token'
 export ENABLE_TOOL_SEARCH=false
 export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
+export CLAUDE_CODE_AUTO_MODE_SERVER=0
 
 claude
 ```
@@ -193,6 +199,40 @@ override your shell environment, so check them if `/status` shows another URL.
 background requests, to your chosen upstream model. Claude Code continues to
 use its requested model ID in the response. This preserves its client-side
 model selection. The actual model is determined by the mapping below.
+
+### Claude Code auto mode
+
+[Auto mode](https://code.claude.com/docs/en/permission-modes#eliminate-prompts-with-auto-mode)
+uses a separate classifier to review tool actions. Recent Claude Code releases
+can request server-side review through a `safeguards` request field.
+Chat Completions and ChatGPT Responses do not supply Anthropic safety verdicts.
+The proxy rejects `safeguards` with HTTP 400 and a configuration hint. Keep
+`CLAUDE_CODE_AUTO_MODE_SERVER=0` and
+`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` in the Claude Code terminal, then
+start a new session. See Anthropic's
+[classifier compatibility guidance](https://code.claude.com/docs/en/auto-mode-classifier-billing).
+
+In an isolated local check, Claude Code 2.1.316 sent non-streaming classifier
+requests to `/v1/messages?beta=true`, requesting `claude-sonnet-5`, a 64-token
+budget, and `stop_sequences: ["</severity>"]`. Setting
+`CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` still permitted those classifier
+calls. ChatGPT mode handles their stop markers locally in the buffered reply. This avoids the earlier HTTP 400 rejection for
+all stop-sequence requests. Matching also works when a marker spans upstream
+stream events. Streaming stop-sequence requests remain unsupported.
+
+Classifier requests use the same `model_map` and fallback `model` as other
+requests. A fixed `model` also routes these checks to your OpenAI model. With
+only `model_map` configured, include the classifier's requested ID or set a
+fallback `model` so it reaches a model your upstream serves. Classifier IDs can
+change with Claude Code releases.
+
+**Safety limit:** classifier decisions come from the selected upstream model.
+Their safety quality has not been evaluated against Anthropic's classifier.
+The proxy does not generate approval verdicts or implement Anthropic's
+server-side safety checks. In ChatGPT mode, the classifier's `max_tokens` budget
+is also unenforced, so its full reply can increase latency and usage. For
+sensitive work, or a Claude Code release that requires server-side review,
+use manual approval with `claude --permission-mode default`.
 
 ### Verify the HTTP connection
 
@@ -427,8 +467,10 @@ Responses equivalents and [additional limits](#chatgpt-specific-limits).
   also carries `X-Ant2oai-Usage: unavailable` in this case. Streaming starts
   with zero usage and reports available upstream counts in the final
   `message_delta`. These values are never presented as tokenizer estimates.
-- OpenAI does not identify which stop string matched. The proxy returns
-  `stop_sequence: null` and maps a normal `stop` finish to `end_turn`.
+- In API-key Chat Completions mode, the upstream does not identify which stop
+  string matched. The proxy returns `stop_sequence: null` and maps a normal
+  `stop` finish to `end_turn`. ChatGPT mode reports locally matched sequences
+  for non-streaming Messages replies as described above.
 - The proxy's HTTP API omits model discovery (`/v1/models`) and Anthropic
   account/billing endpoints. The `models` CLI command lists account-specific
   ChatGPT models. Use explicit model aliases in Claude Code if needed.
@@ -450,9 +492,10 @@ API-key mode reads its upstream credential from `OPENAI_API_KEY`. ChatGPT
 mode reads its selected saved OAuth token set. Inbound credentials, cookies,
 beta headers, and tracing headers are never forwarded.
 Upstream redirects are refused. Logs include generated request IDs, status,
-duration, and safe stream errors. Request bodies, response bodies, API keys,
-and OAuth tokens are excluded. Upstream error bodies are replaced by safe messages because
-providers may include credentials or prompt fragments in them.
+duration, safe HTTP failure reasons, and safe stream errors. Request bodies,
+response bodies, API keys, and OAuth tokens are excluded. Upstream error bodies
+are replaced by safe messages because providers may include credentials or
+prompt fragments in them.
 
 Incoming HTTP has no TLS. Use a trusted TLS reverse proxy or an SSH tunnel
 for connections across machines. Keep the upstream on HTTPS or a trusted local
@@ -511,19 +554,26 @@ every network feature, including the WebFetch domain safety check.
 | ChatGPT HTTP 403 or 429 | Check the safe upstream error code and ChatGPT Settings → Usage; an app-specific restriction or limit can apply |
 | Upstream endpoint/model missing | Check the `/v1` or other API prefix in `OPENAI_BASE_URL`, then the selected model |
 | Upstream rejects the request | Check tool support, model output/context limits, token-limit field, and sampling restrictions |
-| Tool search or beta-field HTTP 400 | Set the two compatibility variables in the Claude Code example and start a new session |
+| Tool search or beta-field HTTP 400 | Set the compatibility variables in the Claude Code example and start a new session |
+| Auto mode classifier HTTP 400 | Check the logged `reason`; use `CLAUDE_CODE_AUTO_MODE_SERVER=0` and the beta setting above; rebuild and restart for non-streaming ChatGPT stop-marker support |
 | Context window exceeded | Run `/compact`; choose a model with enough context for Claude Code's prompt |
 | Output budget rejected | Set Claude Code's `CLAUDE_CODE_MAX_OUTPUT_TOKENS` below the upstream model's output limit |
 | Stream stalls or times out | Check reverse-proxy buffering and the upstream idle/total timeouts |
 | Local HTTP 429 | Reduce parallel agents or adjust the local admission limits |
 
 The `request-id` response header links a failure to the proxy's completion log.
-The proxy deliberately excludes raw provider error messages. In ChatGPT mode,
-HTTP error statuses are preserved. `X-Ant2oai-Upstream-Status`, an allowlisted
-`X-Ant2oai-Upstream-Code`, and a validated `X-Ant2oai-Upstream-Request-Id`
-provide safe diagnostics when available. Bodies shaped as `detail` receive a
-generic message. Check the upstream server's diagnostics or provide the safe
-request ID to OpenAI when more context is needed. Temporary failures do not
+HTTP failures include a proxy-controlled `reason` and `error_type` in that log.
+`error_source=proxy` means the proxy generated the error, including validation
+and translation failures. `error_source=upstream` means the upstream returned an
+HTTP error; `upstream_status` records its original status. The proxy deliberately
+excludes raw decoder and provider error messages.
+
+`X-Ant2oai-Upstream-Status` is returned for upstream HTTP errors in both modes.
+In ChatGPT mode, HTTP error statuses are preserved, and an allowlisted
+`X-Ant2oai-Upstream-Code` and a validated `X-Ant2oai-Upstream-Request-Id`
+provide additional safe diagnostics when available. Bodies shaped as `detail`
+receive a generic message. Check the upstream server's diagnostics or provide
+the safe request ID to OpenAI when more context is needed. Temporary failures do not
 trigger a billing-mode fallback.
 
 ## Development

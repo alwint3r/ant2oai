@@ -84,9 +84,20 @@ func (server *proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request
 	recorded := &statusWriter{ResponseWriter: writer}
 	started := time.Now()
 	defer func() {
-		slog.Info("request completed",
+		fields := []any{
 			"request_id", requestID, "status", recorded.status,
-			"duration", time.Since(started).Round(time.Millisecond))
+			"duration", time.Since(started).Round(time.Millisecond),
+		}
+		if recorded.failure != nil {
+			source := "proxy"
+			if upstreamStatus := recorded.Header().Get("X-Ant2oai-Upstream-Status"); upstreamStatus != "" {
+				source = "upstream"
+				fields = append(fields, "upstream_status", upstreamStatus)
+			}
+			fields = append(fields, "error_source", source,
+				"error_type", recorded.failure.Type, "reason", recorded.failure.Message)
+		}
+		slog.Info("request completed", fields...)
 	}()
 	writer = recorded
 
@@ -150,9 +161,16 @@ func (server *proxy) ServeHTTP(writer http.ResponseWriter, request *http.Request
 	err = decoder.Decode(&input)
 	var trailing any
 	if err != nil || decoder.Decode(&trailing) != io.EOF {
-		writeAPIError(writer, http.StatusBadRequest, "invalid_request_error",
-			"Expected one valid Messages request with supported fields. "+
-				"Disable experimental betas and check the compatibility guide in README.md.", requestID)
+		message := "Expected one valid Messages request with supported fields. " +
+			"Disable experimental betas and check the compatibility guide in README.md."
+		// Match this known field without exposing arbitrary decoder errors, which
+		// can include client-supplied field names or values.
+		if err != nil && err.Error() == `json: unknown field "safeguards"` {
+			message = "safeguards: server-side auto-mode safety checks are unsupported. " +
+				"Set CLAUDE_CODE_AUTO_MODE_SERVER=0 and " +
+				"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1, then start a new session."
+		}
+		writeAPIError(writer, http.StatusBadRequest, "invalid_request_error", message, requestID)
 		return
 	}
 
@@ -338,6 +356,7 @@ func (server *proxy) writeUpstreamError(
 		writeChatGPTUpstreamError(writer, response, requestID)
 		return
 	}
+	writer.Header().Set("X-Ant2oai-Upstream-Status", strconv.Itoa(response.StatusCode))
 	status := http.StatusBadGateway
 	errorType := "api_error"
 	message := fmt.Sprintf("Upstream returned HTTP %d. Check its configuration and availability.",
@@ -542,7 +561,7 @@ func (server *proxy) serveStream(
 		return
 	}
 	if !input.Stream {
-		output, err := translateResponse(*responses.final, input, messageID)
+		output, err := translateResponsesMessage(*responses.final, input, messageID)
 		if err != nil {
 			streamError(err.Error())
 			return
@@ -578,8 +597,14 @@ func writeEvent(writer http.ResponseWriter, event messageEvent) error {
 }
 
 func writeAPIError(writer http.ResponseWriter, status int, kind, message, requestID string) {
+	// Callers supply proxy-controlled messages. Raw decoder and provider errors
+	// must stay out of responses and the completion log.
+	failure := apiError{Type: kind, Message: message}
+	if recorded, ok := writer.(*statusWriter); ok {
+		recorded.failure = &failure
+	}
 	writeJSON(writer, status, errorResponse{
-		Type: "error", Error: apiError{Type: kind, Message: message}, RequestID: requestID,
+		Type: "error", Error: failure, RequestID: requestID,
 	})
 }
 
@@ -605,7 +630,8 @@ func writeJSON(writer http.ResponseWriter, status int, value any) {
 
 type statusWriter struct {
 	http.ResponseWriter
-	status int
+	status  int
+	failure *apiError
 }
 
 func (writer *statusWriter) Unwrap() http.ResponseWriter { return writer.ResponseWriter }
