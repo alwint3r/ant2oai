@@ -462,8 +462,12 @@ func (server *proxy) serveStream(
 	}
 	streamError := func(message string) {
 		slog.Warn("stream failed", "request_id", requestID, "reason", message)
+		failure := &apiError{Type: "api_error", Message: message}
+		if recorded, ok := writer.(*statusWriter); ok {
+			recorded.failure = failure
+		}
 		if input.Stream {
-			writeEvent(writer, messageEvent{Type: "error", Error: &apiError{Type: "api_error", Message: message}})
+			writeEvent(writer, messageEvent{Type: "error", Error: failure})
 		} else {
 			status := http.StatusBadGateway
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {

@@ -52,7 +52,10 @@ type inputMessage struct {
 type inputBlock struct {
 	Type      string          `json:"type"`
 	Text      *string         `json:"text"`
-	Source    *imageSource    `json:"source"`
+	Source    *contentSource  `json:"source"`
+	Title     string          `json:"title"`
+	Context   string          `json:"context"`
+	Citations json.RawMessage `json:"citations"`
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Input     json.RawMessage `json:"input"`
@@ -61,7 +64,7 @@ type inputBlock struct {
 	IsError   bool            `json:"is_error"`
 }
 
-type imageSource struct {
+type contentSource struct {
 	Type      string `json:"type"`
 	MediaType string `json:"media_type"`
 	Data      string `json:"data"`
@@ -116,10 +119,16 @@ type chatPart struct {
 	Type     string        `json:"type"`
 	Text     *string       `json:"text,omitempty"`
 	ImageURL *chatImageURL `json:"image_url,omitempty"`
+	File     *chatFile     `json:"file,omitempty"`
 }
 
 type chatImageURL struct {
 	URL string `json:"url"`
+}
+
+type chatFile struct {
+	Filename string `json:"filename"`
+	FileData string `json:"file_data"`
 }
 
 type functionTool struct {

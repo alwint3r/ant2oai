@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash"
 	"strings"
 )
@@ -44,10 +45,12 @@ type responsesInputPart struct {
 	Text     *string `json:"text,omitempty"`
 	ImageURL string  `json:"image_url,omitempty"`
 	Detail   string  `json:"detail,omitempty"`
+	Filename string  `json:"filename,omitempty"`
+	FileData string  `json:"file_data,omitempty"`
 }
 
 // Start with the validated Chat Completions translation, which already checks
-// tool history and moves tool-result images after all pending tool replies.
+// tool history and moves tool-result attachments after all pending tool replies.
 func translateResponsesRequest(input completionRequest) (responsesRequest, error) {
 	result := responsesRequest{Model: input.Model, Store: false, Stream: true,
 		Input: make([]responsesInputItem, 0), ToolChoice: input.ToolChoice,
@@ -100,12 +103,19 @@ func translateResponsesRequest(input completionRequest) (responsesRequest, error
 			if parts, isMultipart := content.([]chatPart); isMultipart {
 				converted := make([]responsesInputPart, 0, len(parts))
 				for _, part := range parts {
-					if part.Type == "text" {
+					switch part.Type {
+					case "text":
 						converted = append(converted, responsesInputPart{Type: "input_text", Text: part.Text})
-					} else {
+					case "image_url":
 						converted = append(converted, responsesInputPart{
 							Type: "input_image", ImageURL: part.ImageURL.URL, Detail: "auto",
 						})
+					case "file":
+						converted = append(converted, responsesInputPart{
+							Type: "input_file", Filename: part.File.Filename, FileData: part.File.FileData,
+						})
+					default:
+						return result, errors.New("unsupported translated Responses content part")
 					}
 				}
 				content = converted
@@ -329,7 +339,15 @@ func (translator *responsesStream) consume(data []byte, eventName string) ([]mes
 		if event.OutputIndex == nil || event.Item == nil {
 			return nil, errors.New("upstream returned incomplete Responses output metadata")
 		}
-		return translator.completeItem(*event.OutputIndex, *event.Item)
+		events, err := translator.completeItem(*event.OutputIndex, *event.Item)
+		if err != nil {
+			return nil, err
+		}
+		// Retain the verified snapshot for terminal events with an empty output array.
+		state := translator.items[*event.OutputIndex]
+		state.item = *event.Item
+		state.isDone = true
+		return events, nil
 	case "response.completed", "response.incomplete":
 		return translator.completeResponse(event)
 	}
@@ -411,7 +429,6 @@ func (translator *responsesStream) completeItem(
 	if state == nil || item.ID != state.item.ID || item.Type != state.item.Type {
 		return nil, errors.New("upstream changed Responses output metadata")
 	}
-	state.isDone = true
 	if item.Type == "function_call" {
 		if item.CallID != state.item.CallID || item.Name != state.item.Name || item.Namespace != "" {
 			return nil, errors.New("upstream changed Responses tool metadata")
@@ -454,10 +471,39 @@ func (translator *responsesStream) completeItem(
 
 func (translator *responsesStream) completeResponse(event responsesEvent) ([]messageEvent, error) {
 	response := event.Response
-	if response == nil || response.ID == "" || response.ID != translator.responseID ||
-		len(response.Output) != len(translator.items) || response.Error != nil {
-		return nil, errors.New("upstream returned an invalid Responses completion")
+	if response == nil {
+		return nil, errors.New("upstream Responses completion is missing its response object")
 	}
+	if translator.responseID == "" {
+		return nil, errors.New("upstream Responses completion arrived before response.created")
+	}
+	if response.ID == "" || response.ID != translator.responseID {
+		return nil, errors.New("upstream Responses completion ID does not match response.created")
+	}
+	if response.Error != nil {
+		message, _ := chatGPTFailureMessage(response.Error.Code)
+		return nil, errors.New(message)
+	}
+
+	// The direct route can send an empty final output array. Recover the
+	// output only from item-done snapshots already checked against the deltas.
+	output := response.Output
+	if output != nil && len(output) == 0 && len(translator.items) > 0 {
+		output = make([]responsesOutputItem, len(translator.items))
+		for index := range output {
+			state := translator.items[index]
+			if !state.isDone {
+				return nil, errors.New("upstream Responses completion has empty output " +
+					"before all streamed items completed")
+			}
+			output[index] = state.item
+		}
+	}
+	if len(output) != len(translator.items) {
+		return nil, fmt.Errorf("upstream Responses completion output count mismatch: streamed=%d final=%d",
+			len(translator.items), len(output))
+	}
+
 	finish := "stop"
 	if event.Type == "response.incomplete" && response.Status == "incomplete" &&
 		response.IncompleteDetails != nil {
@@ -476,7 +522,7 @@ func (translator *responsesStream) completeResponse(event responsesEvent) ([]mes
 	var events []messageEvent
 	var text, refusal strings.Builder
 	message := completionMessage{Role: "assistant"}
-	for index, item := range response.Output {
+	for index, item := range output {
 		additional, err := translator.completeItem(index, item)
 		if err != nil {
 			return nil, err

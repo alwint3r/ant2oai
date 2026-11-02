@@ -6,6 +6,18 @@ Initial implementation. This release introduces the configuration keys and HTTP
 contract described in `README.md`; there is no earlier release to migrate from.
 
 - Translate Anthropic Messages requests to OpenAI Chat Completions.
+- Support inline base64 PDF documents in user messages and tool results,
+  including existing Claude Code conversation history. Forward the full PDF as
+  a Chat Completions `file` or Responses `input_file` part. Tool-result PDFs
+  follow all pending tool replies with their tool-call associations preserved.
+  Validate base64 and report nested content indices with safe block-type errors.
+  PDF title/context metadata, citation options, and other source types remain
+  unsupported. Existing text and image requests keep their translations.
+- Accept empty terminal Responses `output` arrays when every streamed item has
+  a validated `response.output_item.done` snapshot. Preserve response-ID, status,
+  content, tool-argument, refusal, and usage validation. Add specific safe errors
+  for other completion mismatches. Completion logs now record streaming failure
+  reasons even when the HTTP 200 headers have already been sent.
 - Support `stop_sequences` in non-streaming ChatGPT Messages requests, including
   Claude Code's client-side auto-mode classifier calls. Match the earliest
   marker after full response validation and return the matched stop sequence.

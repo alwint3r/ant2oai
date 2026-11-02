@@ -329,12 +329,41 @@ func translateUserBlock(block inputBlock, role string) (chatPart, error) {
 			return chatPart{}, errors.New("image source type must be base64 or url")
 		}
 		return chatPart{Type: "image_url", ImageURL: &chatImageURL{URL: imageURL}}, nil
+	case "document":
+		if role != "user" || block.Source == nil {
+			return chatPart{}, errors.New("PDF documents require a user message and a source")
+		}
+		// Reject document options whose meaning would be lost in this translation.
+		if block.Title != "" || block.Context != "" || hasValue(block.Citations) {
+			return chatPart{}, errors.New("PDF document title, context, and citations are unsupported")
+		}
+
+		source := block.Source
+		if source.Type != "base64" || source.MediaType != "application/pdf" {
+			return chatPart{}, errors.New("document source must be base64 with media_type application/pdf")
+		}
+		if source.Data == "" {
+			return chatPart{}, errors.New("base64 PDF documents require data")
+		}
+		decoder := base64.NewDecoder(base64.StdEncoding, strings.NewReader(source.Data))
+		decodedBytes, err := io.Copy(io.Discard, decoder)
+		if err != nil || decodedBytes == 0 {
+			return chatPart{}, errors.New("PDF document data must be non-empty valid base64")
+		}
+
+		return chatPart{Type: "file", File: &chatFile{
+			Filename: "document.pdf", FileData: "data:application/pdf;base64," + source.Data,
+		}}, nil
 	case "tool_reference":
 		return chatPart{}, errors.New("tool_reference requires Anthropic tool search; " +
 			"set ENABLE_TOOL_SEARCH=false and start a new session")
+	case "search_result", "audio", "video":
+		// Only known type names are safe to include in completion logs.
+		return chatPart{}, fmt.Errorf("unsupported content block type %s; "+
+			"supported user blocks are text, images, PDF documents, and tool results", block.Type)
 	default:
 		return chatPart{}, errors.New("unsupported content block; " +
-			"supported user blocks are text, images, and tool results")
+			"supported user blocks are text, images, PDF documents, and tool results")
 	}
 }
 
@@ -346,20 +375,26 @@ func translateToolResult(block inputBlock) (string, []chatPart, error) {
 		if err != nil {
 			return "", nil, err
 		}
-		for _, content := range blocks {
+		for index, content := range blocks {
 			part, err := translateUserBlock(content, "user")
 			if err != nil {
-				return "", nil, err
+				return "", nil, fmt.Errorf("content[%d]: %w", index, err)
 			}
 			if part.Type == "text" {
 				texts = append(texts, *part.Text)
-			} else {
-				// Tool messages accept text. Move images to a user message after
-				// every pending tool reply and retain an explicit association.
-				texts = append(texts, "[Tool result image attached in the following user message.]")
-				label := "Image from tool result " + block.ToolUseID + ":"
-				attachments = append(attachments, chatPart{Type: "text", Text: &label}, part)
+				continue
 			}
+
+			// Attachments follow every pending tool reply. Labels retain their
+			// association with the tool call after moving to a user message.
+			marker := "[Tool result image attached in the following user message.]"
+			label := "Image from tool result " + block.ToolUseID + ":"
+			if part.Type == "file" {
+				marker = "[Tool result PDF attached in the following user message.]"
+				label = "PDF from tool result " + block.ToolUseID + ":"
+			}
+			texts = append(texts, marker)
+			attachments = append(attachments, chatPart{Type: "text", Text: &label}, part)
 		}
 	}
 

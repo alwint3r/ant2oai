@@ -9,9 +9,10 @@ Claude Code → POST /v1/messages → ant2oai ┬→ Chat Completions (API key)
                                          └→ Public Responses API (ChatGPT OAuth)
 ```
 
-The proxy handles text, streaming, client-side tools, parallel tool calls, and
-images. Your upstream model must support the features you use. Coding-agent
-quality depends on that model's ability to follow instructions and call tools.
+The proxy handles text, streaming, client-side tools, parallel tool calls,
+images, and inline PDFs. Your upstream model must support the features you use.
+Coding-agent quality depends on that model's ability to follow instructions and
+call tools.
 
 ## Build and start with an API key
 
@@ -138,10 +139,16 @@ is unconfirmed, disconnect the app in ChatGPT Settings.
   required history sent in `input`. Non-streaming Messages clients receive a
   buffered JSON response after stream validation finishes. The direct route can
   omit `Content-Type`. ant2oai accepts SSE with a missing or `text/plain` header
-  and applies the same stream limits and Responses completion checks.
+  and applies the same stream limits and Responses completion checks. If the
+  terminal event contains an empty `output` array, the proxy uses the validated
+  `response.output_item.done` snapshots. Every streamed item must have a complete
+  snapshot. Response-ID, status, content, tool-argument, refusal, and usage checks
+  remain in place.
 - System text becomes developer messages. Functions are supplied through
-  developer `additional_tools` input items. Text, images, tool choices,
-  parallel calls, and tool-result history use the Responses equivalents.
+  developer `additional_tools` input items. Text, images, inline PDFs, tool
+  choices, parallel calls, and tool-result history use the Responses equivalents.
+  PDFs use `input_file` with inline data; the proxy does not use the Files
+  upload API.
 - OpenAI's direct route rejects output-token caps and sampling parameters.
   Anthropic `max_tokens` remains required and validated. Its limit is
   **not enforced in ChatGPT mode**. `temperature` and `top_p` are omitted.
@@ -431,7 +438,8 @@ Responses equivalents and [additional limits](#chatgpt-specific-limits).
 | Tool errors | `is_error` represented by a `Tool error: ` text prefix |
 | Effort | `output_config.effort` (`low`, `medium`, `high`, `xhigh`, `max`) forwarded unchanged as `reasoning_effort`; other values receive HTTP 400 |
 | Images | Base64 JPEG/PNG/GIF/WebP or HTTP(S) URLs translated to `image_url` parts |
-| Tool-result images | Tool text retains a marker; images follow all tool replies in a user message with the tool-call ID |
+| PDFs | Base64 `application/pdf` document blocks translated to `file` parts; upstream and model must support PDF inputs |
+| Tool-result attachments | Tool text retains markers; images and PDFs follow all tool replies in a user message with the tool-call ID |
 | Stops | `stop` → `end_turn`, `length` → `max_tokens`, tool calls → `tool_use`, content filters → `refusal` |
 | Usage | Upstream prompt/completion counts translated; cached prompt tokens separated into `cache_read_input_tokens` |
 | Startup probe | `HEAD /api/hello` returns 204 |
@@ -458,9 +466,15 @@ Responses equivalents and [additional limits](#chatgpt-specific-limits).
   omitted.
   Upstream automatic prompt caching can still operate. `service_tier: auto`
   is accepted and omitted.
+- PDF documents require `source.type: "base64"` and
+  `source.media_type: "application/pdf"`. Base64 is validated and the full PDF
+  data is forwarded. PDF title/context metadata and citation options receive
+  HTTP 400. URL, file-ID, text, and other document sources remain unsupported.
+  The incoming body limit includes the encoded PDF and conversation history;
+  the upstream can impose additional file-size, page-count, and context limits.
 - Structured output formats, task budgets, context-management requests,
-  `top_k`, assistant prefill, documents/PDFs, audio, and unsupported content
-  block types receive HTTP 400. Unknown top-level fields are rejected.
+  `top_k`, assistant prefill, audio, and unsupported content block types receive
+  HTTP 400. Unknown top-level fields are rejected.
   `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1` removes several incompatible
   Claude Code request fields.
 - `POST /v1/messages/count_tokens` returns an Anthropic-shaped HTTP 404.
@@ -636,6 +650,26 @@ configuration changes and Claude Code upgrades.
 
 ## Troubleshooting
 
+### Repeated tool-result errors after reading a PDF
+
+Claude Code can return a whole PDF as a `document` block inside a tool result.
+Earlier ant2oai builds rejected that block. The result stays in conversation
+history, so subsequent prompts and retries can produce the same HTTP 400.
+
+Update and restart ant2oai with the same configuration, then retry in the
+existing Claude Code session. The proxy now translates inline base64 PDFs,
+including those already stored in tool-result history. Clearing the conversation
+is unnecessary for this compatibility error. The selected upstream and model
+must accept PDF inputs.
+
+When the upstream lacks PDF support, read explicit page ranges with Claude
+Code's `Read` tool to obtain images, or extract text with `pdftotext` through
+Bash. The image route requires an image-capable model. These alternatives affect
+new tool results; existing PDF blocks still require a PDF-capable upstream or
+conversation history that excludes those blocks.
+
+### Other errors
+
 | Symptom | Check |
 | --- | --- |
 | Local HTTP 401 | Use the proxy token as `ANTHROPIC_AUTH_TOKEN`; check `/status` for settings overrides |
@@ -658,6 +692,14 @@ HTTP failures include a proxy-controlled `reason` and `error_type` in that log.
 and translation failures. `error_source=upstream` means the upstream returned an
 HTTP error; `upstream_status` records its original status. The proxy deliberately
 excludes raw decoder and provider error messages.
+
+Streaming sends HTTP 200 before the final upstream result is known. A later
+failure is delivered as an SSE `error` event and recorded in the completion
+log's `reason`, even when its HTTP `status` is 200. Failed streams do not emit a
+successful `message_stop`. Buffered requests can still return HTTP 502 when
+completion validation fails. An empty terminal Responses `output` array is
+accepted only after all streamed items have validated item-done snapshots;
+other output-count and response-ID mismatches have specific safe diagnostics.
 
 `X-Ant2oai-Upstream-Status` is returned for upstream HTTP errors in both modes.
 In ChatGPT mode, HTTP error statuses are preserved, and an allowlisted
