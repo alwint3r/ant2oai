@@ -19,7 +19,7 @@ type config struct {
 	authFile            string
 	account             string
 	requestConsent      bool
-	listen              string
+	listenAddresses     []string
 	upstreamBaseURL     string
 	upstreamAPIKey      string
 	proxyAPIKey         string
@@ -48,7 +48,7 @@ func loadConfig(arguments []string, output io.Writer) (config, error) {
 		flags.PrintDefaults()
 	}
 
-	var modelMapJSON, configPath string
+	var modelMapJSON, configPath, listenList string
 	flags.StringVar(&configPath, "config", "",
 		"JSON configuration file (ANT2OAI_CONFIG)")
 	flags.StringVar(&cfg.authMode, "auth-mode", "api-key",
@@ -59,8 +59,8 @@ func loadConfig(arguments []string, output io.Writer) (config, error) {
 		"Saved ChatGPT account label (ANT2OAI_ACCOUNT)")
 	flags.BoolVar(&cfg.requestConsent, "reconsent", false,
 		"Ask for ChatGPT plan permission again during login")
-	flags.StringVar(&cfg.listen, "listen", "127.0.0.1:8080",
-		"HTTP listen address (ANT2OAI_LISTEN)")
+	flags.StringVar(&listenList, "listen", "127.0.0.1:8080",
+		"HTTP listen addresses, separated by commas (ANT2OAI_LISTEN)")
 	flags.StringVar(&cfg.upstreamBaseURL, "upstream-base-url", "https://api.openai.com/v1",
 		"Upstream API base URL, including API prefix (OPENAI_BASE_URL)")
 	flags.StringVar(&cfg.model, "model", "",
@@ -201,17 +201,22 @@ func loadConfig(arguments []string, output io.Writer) (config, error) {
 			"unset OPENAI_BASE_URL or override upstream-base-url")
 	}
 
-	host, port, err := net.SplitHostPort(cfg.listen)
-	if err != nil {
-		return cfg, errors.New("listen must have the form host:port")
-	}
-	portNumber, err := strconv.Atoi(port)
-	if err != nil || portNumber < 0 || portNumber > 65535 {
-		return cfg, errors.New("listen port must be between 0 and 65535")
-	}
-	if !isLoopbackHost(host) && cfg.proxyAPIKey == "" {
-		return cfg, errors.New("a proxy key is required when listening outside loopback; " +
-			"set ANT2OAI_API_KEY or JSON proxy_api_key")
+	// One proxy key covers all addresses, so one non-loopback address requires it.
+	for _, entry := range strings.Split(listenList, ",") {
+		address := strings.TrimSpace(entry)
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return cfg, fmt.Errorf("listen address %q must have the form host:port", address)
+		}
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 0 || portNumber > 65535 {
+			return cfg, fmt.Errorf("listen address %q needs a port from 0 to 65535", address)
+		}
+		if !isLoopbackHost(host) && cfg.proxyAPIKey == "" {
+			return cfg, errors.New("a proxy key is required when listening outside loopback; " +
+				"set ANT2OAI_API_KEY or JSON proxy_api_key")
+		}
+		cfg.listenAddresses = append(cfg.listenAddresses, address)
 	}
 
 	return cfg, nil

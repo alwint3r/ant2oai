@@ -391,6 +391,19 @@ Run `./bin/ant2oai -help` for built-in help. Plain `ant2oai` and
 Boolean environment values accept `true` and `false`. Set a false boolean flag
 with `-stream-usage=false` or `-omit-sampling=false`.
 
+`listen` accepts several addresses in one comma-separated string. This works
+the same way in the flag, the environment variable, and the JSON key:
+
+```sh
+./bin/ant2oai -listen '127.0.0.1:8080,[::1]:8080,100.64.0.1:8080'
+```
+
+All addresses use the same settings, and they share the proxy key and the
+`max-concurrent` and `requests-per-minute` limits. The proxy does not start if
+any address cannot be opened. If one listener fails later, the proxy stops
+accepting requests on all addresses, lets active requests finish, and exits
+with status 1.
+
 ### Provider differences
 
 These flags apply to API-key Chat Completions mode. For OpenAI models that
@@ -502,6 +515,8 @@ Responses equivalents and [additional limits](#chatgpt-specific-limits).
 The proxy binds to loopback by default. Local authentication is optional on
 loopback; enabling it is recommended on shared machines. Other listen
 addresses require a proxy key from `ANT2OAI_API_KEY` or JSON `proxy_api_key`.
+When `listen` has several addresses, one non-loopback address is enough to
+require the key, and clients on every address must then send it.
 Both `Authorization: Bearer ...` and
 `x-api-key: ...` are accepted for local authentication.
 

@@ -6,6 +6,13 @@ Initial implementation. This release introduces the configuration keys and HTTP
 contract described in `README.md`; there is no earlier release to migrate from.
 
 - Translate Anthropic Messages requests to OpenAI Chat Completions.
+- Accept several comma-separated addresses in `listen` (`-listen`,
+  `ANT2OAI_LISTEN`, or the JSON key). One HTTP server handles all addresses, so
+  they share the proxy key and the concurrency and rate limits. A non-loopback
+  address requires a proxy key, which then applies on every address. Startup
+  fails if any address cannot be opened. Existing single-address values keep
+  working. A listener failure now shuts the proxy down gracefully, exits with
+  status 1, and logs the reason.
 - Support inline base64 PDF documents in user messages and tool results,
   including existing Claude Code conversation history. Forward the full PDF as
   a Chat Completions `file` or Responses `input_file` part. Tool-result PDFs

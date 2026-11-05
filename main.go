@@ -64,13 +64,13 @@ func run(arguments []string) int {
 		slog.Info("using saved ChatGPT account", "account", cfg.account)
 	}
 
-	listener, err := net.Listen("tcp", cfg.listen)
+	listeners, err := openListeners(cfg.listenAddresses)
 	if err != nil {
 		slog.Error("could not open listener", "reason", err.Error())
 		return 1
 	}
 
-	// Keep requests alive during the graceful shutdown period after a signal.
+	// Keep requests alive during the graceful shutdown period.
 	requestContext, cancelRequests := context.WithCancel(context.Background())
 	defer cancelRequests()
 	httpServer := &http.Server{
@@ -85,21 +85,28 @@ func run(arguments []string) int {
 
 	stopContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
-	serveErrors := make(chan error, 1)
-	go func() { serveErrors <- httpServer.Serve(listener) }()
 
-	slog.Info("proxy listening", "address", listener.Addr().String())
+	// All listeners share one server, so the proxy key and limits cover every address.
+	// The channel holds one result per listener, so no Serve goroutine blocks on send.
+	serveErrors := make(chan error, len(listeners))
+	for _, listener := range listeners {
+		go func() { serveErrors <- httpServer.Serve(listener) }()
+		slog.Info("proxy listening", "address", listener.Addr().String())
+	}
 	if cfg.proxyAPIKey == "" {
 		slog.Warn("local authentication is disabled; set ANT2OAI_API_KEY or JSON proxy_api_key")
 	}
 
+	exitCode := 0
 	select {
 	case err := <-serveErrors:
-		if !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("HTTP server failed")
-			return 1
+		if errors.Is(err, http.ErrServerClosed) {
+			return 0
 		}
-		return 0
+		// Stop the whole proxy, because a partly reachable proxy is hard to notice.
+		// The graceful shutdown below lets requests on the other listeners finish.
+		slog.Error("HTTP server failed", "reason", err.Error())
+		exitCode = 1
 	case <-stopContext.Done():
 	}
 
@@ -116,5 +123,21 @@ func run(arguments []string) int {
 			return 1
 		}
 	}
-	return 0
+	return exitCode
+}
+
+// openListeners opens every address or none, so a failed start keeps no port bound.
+func openListeners(addresses []string) ([]net.Listener, error) {
+	listeners := make([]net.Listener, 0, len(addresses))
+	for _, address := range addresses {
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			for _, opened := range listeners {
+				err = errors.Join(err, opened.Close())
+			}
+			return nil, err
+		}
+		listeners = append(listeners, listener)
+	}
+	return listeners, nil
 }
