@@ -734,8 +734,11 @@ make test   # Run go test ./...
 go test -race ./...
 ```
 
-The repository currently has no test files. Follow `AGENTS.md` before adding
-tests. `main.go` owns process lifetime, `config.go` and `config_file.go` load
+Tests run without external network access. They use fake upstreams, fixed dates,
+and loopback sockets only for the login callback and listener checks. Follow
+`AGENTS.md` when you add or change tests.
+
+`main.go` owns process lifetime, `config.go` and `config_file.go` load
 configuration, and `server.go` handles HTTP and admission. The request,
 response, and stream translation files contain the Chat Completions protocol
 logic; `responses.go` adapts the ChatGPT Responses protocol. The `oauth*.go`

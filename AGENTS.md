@@ -37,8 +37,9 @@ for performance.
   only changed files with `gofmt -w <file>` to avoid unrelated changes.
 - **Lint:** `make lint` checks formatting and runs `go vet ./...`.
 - **Test:** `make test` runs `go test ./...`. Also run `go test -race ./...`
-  when a change touches concurrency. No repository test files exist yet;
-  follow section 8 before adding them.
+  when a change touches concurrency. Tests live next to the code in
+  `*_test.go` files, and shared fakes live in `helpers_test.go`. Follow section
+  8 before you add or change them.
 - **Benchmarks:** no benchmark suite exists yet.
 - **Naming in Go:** the examples in section 4 use generic spelling. In Go code,
   use Go conventions: `camelCase` for unexported names, `PascalCase` for
@@ -355,6 +356,9 @@ When someone writes or requests tests, follow these standards:
 - Tests are fast, deterministic, and isolated. They use no real network, no
   sleeps, and no dependence on wall-clock time or test order. Supply clocks and
   fake upstream servers as dependencies.
+- Tests never touch real credentials or default ports, even when the code under
+  test is broken. `TestMain` replaces the home directory. A disposable harness
+  or mutation run needs the same protection.
 - Cover edge cases: empty input, maximum sizes, malformed input, partial or
   interrupted streams, timeouts, and concurrent access.
 - For format translation, prefer table-driven tests or golden files that pair
