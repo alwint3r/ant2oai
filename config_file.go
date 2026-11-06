@@ -18,6 +18,8 @@ type configOption struct {
 	environment string
 }
 
+const maxConfigFileBytes = 1 << 20
+
 func applyJSONConfig(
 	flags *flag.FlagSet, path string, options []configOption, proxyAPIKey *string,
 ) error {
@@ -27,8 +29,8 @@ func applyJSONConfig(
 	}
 	defer file.Close()
 
-	raw, err := io.ReadAll(io.LimitReader(file, (1<<20)+1))
-	if err != nil || len(raw) > 1<<20 || checkJSONDepth(raw) != nil {
+	raw, err := io.ReadAll(io.LimitReader(file, maxConfigFileBytes+1))
+	if err != nil || len(raw) > maxConfigFileBytes || checkJSONDepth(raw) != nil {
 		return errors.New("config must be valid JSON within the 1 MiB and nesting limits")
 	}
 	var values map[string]json.RawMessage
@@ -36,28 +38,13 @@ func applyJSONConfig(
 		return errors.New("config must contain one JSON object")
 	}
 
-	// Credentials have no command-line flag. A file containing a proxy key is
-	// a local secret store, so check the permissions of the opened file.
-	var fileProxyAPIKey string
 	keyValue, hasProxyAPIKey := values["proxy_api_key"]
+	var fileProxyAPIKey string
 	if hasProxyAPIKey {
 		delete(values, "proxy_api_key")
-		if bytes.Equal(bytes.TrimSpace(keyValue), []byte("null")) ||
-			json.Unmarshal(keyValue, &fileProxyAPIKey) != nil {
-			return errors.New("config field proxy_api_key must be a string")
-		}
-		if fileProxyAPIKey != "" {
-			info, err := file.Stat()
-			if err != nil {
-				return fmt.Errorf("inspect config permissions: %w", err)
-			}
-			if !info.Mode().IsRegular() {
-				return errors.New("config containing proxy_api_key must be a regular file")
-			}
-			if runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
-				return errors.New("config containing proxy_api_key requires owner-only permissions; " +
-					"use chmod 600 on the config file")
-			}
+		fileProxyAPIKey, err = parseFileProxyKey(keyValue, file)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -67,6 +54,7 @@ func applyJSONConfig(
 		if !exists {
 			continue
 		}
+
 		delete(values, key)
 		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
 			return fmt.Errorf("config field %s cannot be null", key)
@@ -105,6 +93,7 @@ func applyJSONConfig(
 			return fmt.Errorf("invalid config field %s; check its JSON type and value", key)
 		}
 	}
+
 	if len(values) != 0 {
 		return errors.New("config contains unknown fields; use documented snake_case keys " +
 			"and OPENAI_API_KEY for upstream credentials")
@@ -113,4 +102,30 @@ func applyJSONConfig(
 		*proxyAPIKey = fileProxyAPIKey
 	}
 	return nil
+}
+
+// parseFileProxyKey decodes the proxy key. Credentials have no command-line flag.
+// A file containing a proxy key is a local secret store, so check the permissions
+// of the opened file.
+func parseFileProxyKey(value json.RawMessage, file *os.File) (string, error) {
+	var key string
+	if bytes.Equal(bytes.TrimSpace(value), []byte("null")) || json.Unmarshal(value, &key) != nil {
+		return "", errors.New("config field proxy_api_key must be a string")
+	}
+	if key == "" {
+		return "", nil
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		return "", fmt.Errorf("inspect config permissions: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", errors.New("config containing proxy_api_key must be a regular file")
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
+		return "", errors.New("config containing proxy_api_key requires owner-only permissions; " +
+			"use chmod 600 on the config file")
+	}
+	return key, nil
 }

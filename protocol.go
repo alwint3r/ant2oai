@@ -14,6 +14,9 @@ const (
 	maxToolArguments = 8 << 20
 	maxToolCalls     = 128
 	maxContentBlocks = 1024
+	maxIDBytes       = 256
+	maxToolNameBytes = 64
+	maxStopSequences = 4
 )
 
 type messagesRequest struct {
@@ -276,6 +279,7 @@ func checkJSONDepth(data []byte) error {
 			}
 			continue
 		}
+
 		switch character {
 		case '"':
 			inString = true

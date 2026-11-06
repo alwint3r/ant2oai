@@ -16,6 +16,14 @@ import (
 	"time"
 )
 
+const (
+	oauthRequestTimeout   = 30 * time.Second
+	maxOAuthResponseBytes = 256 << 10
+	maxIDTokenBytes       = 64 << 10
+	maxSigningKeys        = 64
+	maxEmailBytes         = 320
+)
+
 type oauthMetadata struct {
 	Issuer                string `json:"issuer"`
 	AuthorizationEndpoint string `json:"authorization_endpoint"`
@@ -49,13 +57,15 @@ func (oauth oauthClient) metadata(ctx context.Context) (oauthMetadata, error) {
 }
 
 func (oauth oauthClient) getPublicJSON(ctx context.Context, endpoint string, target any) error {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, oauthRequestTimeout)
 	defer cancel()
+
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return errors.New("could not create the OpenAI discovery request")
 	}
 	request.Header.Set("Accept", "application/json")
+
 	response, err := oauth.client.Do(request)
 	if err != nil {
 		return errors.New("could not reach OpenAI OAuth discovery; check network and TLS settings")
@@ -70,24 +80,26 @@ func (oauth oauthClient) getPublicJSON(ctx context.Context, endpoint string, tar
 // OAuth bodies may contain reusable credentials. Never include their contents
 // or decoder errors in diagnostics, including errors returned by OpenAI.
 func decodeOAuthJSON(body io.Reader, target any) error {
-	raw, err := io.ReadAll(io.LimitReader(body, (256<<10)+1))
-	if err != nil || len(raw) > 256<<10 || checkJSONDepth(raw) != nil ||
+	raw, err := io.ReadAll(io.LimitReader(body, maxOAuthResponseBytes+1))
+	if err != nil || len(raw) > maxOAuthResponseBytes || checkJSONDepth(raw) != nil ||
 		json.Unmarshal(raw, target) != nil {
 		return errors.New("OpenAI returned invalid OAuth data or exceeded its size limit")
 	}
 	return nil
 }
 
+type oidcSigningKey struct {
+	Type       string   `json:"kty"`
+	ID         string   `json:"kid"`
+	Algorithm  string   `json:"alg"`
+	Use        string   `json:"use"`
+	Operations []string `json:"key_ops"`
+	Modulus    string   `json:"n"`
+	Exponent   string   `json:"e"`
+}
+
 type oidcSigningKeys struct {
-	Keys []struct {
-		Type       string   `json:"kty"`
-		ID         string   `json:"kid"`
-		Algorithm  string   `json:"alg"`
-		Use        string   `json:"use"`
-		Operations []string `json:"key_ops"`
-		Modulus    string   `json:"n"`
-		Exponent   string   `json:"e"`
-	} `json:"keys"`
+	Keys []oidcSigningKey `json:"keys"`
 }
 
 func (oauth oauthClient) signingKeys(
@@ -101,7 +113,7 @@ func (oauth oauthClient) signingKeys(
 	if len(keys.Keys) == 0 {
 		return oidcSigningKeys{}, errors.New("OpenAI JWKS contains no signing keys")
 	}
-	if len(keys.Keys) > 64 {
+	if len(keys.Keys) > maxSigningKeys {
 		return oidcSigningKeys{}, errors.New("OpenAI JWKS exceeds the supported key limit")
 	}
 	return keys, nil
@@ -129,18 +141,68 @@ func (oauth oauthClient) verifyIDToken(
 	return verifyIDTokenWithKeys(metadata, keys, token, clientID, nonce)
 }
 
+// verifyIDTokenWithKeys checks a token in security order: the signature first,
+// and the claims only after they are known to come from OpenAI.
 func verifyIDTokenWithKeys(
 	metadata oauthMetadata, keys oidcSigningKeys, token, clientID, nonce string,
 ) (oidcClaims, error) {
-	var claims oidcClaims
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 || len(token) > 64<<10 {
-		return claims, errors.New("OpenAI ID token has an invalid JWT encoding")
+	parsed, err := parseIDToken(token)
+	if err != nil {
+		return oidcClaims{}, err
 	}
+
+	publicKey, err := findSigningKey(keys, parsed.keyID)
+	if err != nil {
+		return oidcClaims{}, err
+	}
+	digest := sha256.Sum256([]byte(parsed.signedContent))
+	if rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, digest[:], parsed.signature) != nil {
+		return oidcClaims{}, errors.New("OpenAI ID token signature validation failed")
+	}
+
+	claims := parsed.claims
+	if err := checkAudience(claims, clientID); err != nil {
+		return oidcClaims{}, err
+	}
+
+	now := time.Now().Unix()
+	if claims.Issuer != metadata.Issuer || claims.Subject == "" ||
+		len(claims.Subject) > maxIDBytes || claims.ExpiresAt <= now || claims.IssuedAt <= 0 ||
+		claims.IssuedAt > now+maxClockSkewSeconds ||
+		claims.NotBefore > now+maxClockSkewSeconds || claims.ExpiresAt <= claims.IssuedAt {
+		return oidcClaims{}, errors.New("OpenAI ID token identity or validity period is invalid")
+	}
+	if nonce != "" && claims.Nonce != nonce {
+		return oidcClaims{}, errors.New("OpenAI ID token nonce does not match the sign-in attempt")
+	}
+	if len(claims.Email) > maxEmailBytes {
+		return oidcClaims{}, errors.New("OpenAI ID token email exceeds the supported limit")
+	}
+	return claims, nil
+}
+
+const maxClockSkewSeconds = 60
+
+// parsedIDToken holds a decoded token whose signature is not verified yet.
+type parsedIDToken struct {
+	keyID         string
+	claims        oidcClaims
+	signature     []byte
+	signedContent string
+}
+
+func parseIDToken(token string) (parsedIDToken, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 || len(token) > maxIDTokenBytes {
+		return parsedIDToken{}, errors.New("OpenAI ID token has an invalid JWT encoding")
+	}
+
 	encoding := base64.RawURLEncoding.Strict()
 	headerJSON, headerError := encoding.DecodeString(parts[0])
 	claimsJSON, claimsError := encoding.DecodeString(parts[1])
 	signature, signatureError := encoding.DecodeString(parts[2])
+
+	var claims oidcClaims
 	var header struct {
 		Algorithm string          `json:"alg"`
 		KeyID     string          `json:"kid"`
@@ -149,79 +211,90 @@ func verifyIDTokenWithKeys(
 	if headerError != nil || claimsError != nil || signatureError != nil ||
 		checkJSONDepth(headerJSON) != nil || checkJSONDepth(claimsJSON) != nil ||
 		json.Unmarshal(headerJSON, &header) != nil || json.Unmarshal(claimsJSON, &claims) != nil ||
-		header.Algorithm != "RS256" || header.KeyID == "" || len(header.KeyID) > 256 ||
+		header.Algorithm != "RS256" || header.KeyID == "" || len(header.KeyID) > maxIDBytes ||
 		hasValue(header.Critical) {
-		return oidcClaims{}, errors.New("OpenAI ID token uses an unsupported JWT header or claims encoding")
+		return parsedIDToken{}, errors.New("OpenAI ID token uses an unsupported JWT header " +
+			"or claims encoding")
 	}
 
+	return parsedIDToken{
+		keyID: header.KeyID, claims: claims, signature: signature,
+		signedContent: parts[0] + "." + parts[1],
+	}, nil
+}
+
+// findSigningKey returns the only usable key with this ID. A repeated ID is an
+// error, because the choice between two keys would be arbitrary.
+func findSigningKey(keys oidcSigningKeys, keyID string) (*rsa.PublicKey, error) {
 	var publicKey *rsa.PublicKey
 	for _, key := range keys.Keys {
-		if key.ID != header.KeyID {
+		if key.ID != keyID {
 			continue
 		}
 		if publicKey != nil || key.Type != "RSA" ||
 			key.Algorithm != "" && key.Algorithm != "RS256" || key.Use != "" && key.Use != "sig" {
-			return oidcClaims{}, errors.New("OpenAI ID token references an unsupported signing key")
+			return nil, errors.New("OpenAI ID token references an unsupported signing key")
 		}
-		if len(key.Operations) != 0 {
-			canVerify := false
-			for _, operation := range key.Operations {
-				canVerify = canVerify || operation == "verify"
-			}
-			if !canVerify {
-				return oidcClaims{}, errors.New("OpenAI signing key does not permit verification")
-			}
+
+		parsed, err := key.rsaPublicKey()
+		if err != nil {
+			return nil, err
 		}
-		modulus, modulusError := encoding.DecodeString(key.Modulus)
-		exponent, exponentError := encoding.DecodeString(key.Exponent)
-		if modulusError != nil || exponentError != nil || len(exponent) < 1 || len(exponent) > 4 {
-			return oidcClaims{}, errors.New("OpenAI signing key contains invalid RSA parameters")
-		}
-		exponentValue := 0
-		for _, value := range exponent {
-			exponentValue = exponentValue<<8 | int(value)
-		}
-		publicKey = &rsa.PublicKey{N: new(big.Int).SetBytes(modulus), E: exponentValue}
-		if publicKey.N.BitLen() < 2048 || publicKey.N.BitLen() > 8192 ||
-			publicKey.E < 3 || publicKey.E > 1<<31-1 || publicKey.E%2 != 1 {
-			return oidcClaims{}, errors.New("OpenAI signing key is outside the supported RSA limits")
-		}
-	}
-	if publicKey == nil {
-		return oidcClaims{}, errors.New("OpenAI ID token references an unknown signing key")
-	}
-	digest := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
-	if rsa.VerifyPKCS1v15(publicKey, crypto.SHA256, digest[:], signature) != nil {
-		return oidcClaims{}, errors.New("OpenAI ID token signature validation failed")
+		publicKey = parsed
 	}
 
+	if publicKey == nil {
+		return nil, errors.New("OpenAI ID token references an unknown signing key")
+	}
+	return publicKey, nil
+}
+
+func (key oidcSigningKey) rsaPublicKey() (*rsa.PublicKey, error) {
+	if len(key.Operations) != 0 {
+		canVerify := false
+		for _, operation := range key.Operations {
+			canVerify = canVerify || operation == "verify"
+		}
+		if !canVerify {
+			return nil, errors.New("OpenAI signing key does not permit verification")
+		}
+	}
+
+	encoding := base64.RawURLEncoding.Strict()
+	modulus, modulusError := encoding.DecodeString(key.Modulus)
+	exponent, exponentError := encoding.DecodeString(key.Exponent)
+	if modulusError != nil || exponentError != nil || len(exponent) < 1 || len(exponent) > 4 {
+		return nil, errors.New("OpenAI signing key contains invalid RSA parameters")
+	}
+	exponentValue := 0
+	for _, value := range exponent {
+		exponentValue = exponentValue<<8 | int(value)
+	}
+
+	publicKey := &rsa.PublicKey{N: new(big.Int).SetBytes(modulus), E: exponentValue}
+	if publicKey.N.BitLen() < 2048 || publicKey.N.BitLen() > 8192 ||
+		publicKey.E < 3 || publicKey.E > 1<<31-1 || publicKey.E%2 != 1 {
+		return nil, errors.New("OpenAI signing key is outside the supported RSA limits")
+	}
+	return publicKey, nil
+}
+
+func checkAudience(claims oidcClaims, clientID string) error {
 	var audiences []string
 	var singleAudience string
 	if json.Unmarshal(claims.Audience, &singleAudience) == nil {
 		audiences = []string{singleAudience}
 	} else if json.Unmarshal(claims.Audience, &audiences) != nil {
-		return oidcClaims{}, errors.New("OpenAI ID token audience is invalid")
+		return errors.New("OpenAI ID token audience is invalid")
 	}
+
 	matchesAudience := false
 	for _, audience := range audiences {
 		matchesAudience = matchesAudience || audience == clientID
 	}
 	if !matchesAudience || claims.Party != "" && claims.Party != clientID ||
 		len(audiences) > 1 && claims.Party != clientID {
-		return oidcClaims{}, errors.New("OpenAI ID token audience does not match this registration")
+		return errors.New("OpenAI ID token audience does not match this registration")
 	}
-
-	now := time.Now().Unix()
-	if claims.Issuer != metadata.Issuer || claims.Subject == "" || len(claims.Subject) > 256 ||
-		claims.ExpiresAt <= now || claims.IssuedAt <= 0 || claims.IssuedAt > now+60 ||
-		claims.NotBefore > now+60 || claims.ExpiresAt <= claims.IssuedAt {
-		return oidcClaims{}, errors.New("OpenAI ID token identity or validity period is invalid")
-	}
-	if nonce != "" && claims.Nonce != nonce {
-		return oidcClaims{}, errors.New("OpenAI ID token nonce does not match the sign-in attempt")
-	}
-	if len(claims.Email) > 320 {
-		return oidcClaims{}, errors.New("OpenAI ID token email exceeds the supported limit")
-	}
-	return claims, nil
+	return nil
 }

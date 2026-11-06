@@ -60,7 +60,8 @@ func (translator *streamTranslator) consume(chunk completionResponse) ([]message
 		return nil, errors.New("upstream sent unexpected streaming choices")
 	}
 	choice := chunk.Choices[0]
-	if choice.Delta.Role != "" && choice.Delta.Role != "assistant" || hasValue(choice.Delta.FunctionCall) {
+	hasOtherRole := choice.Delta.Role != "" && choice.Delta.Role != "assistant"
+	if hasOtherRole || hasValue(choice.Delta.FunctionCall) {
 		return nil, errors.New("upstream sent an unsupported streaming delta")
 	}
 
@@ -78,42 +79,8 @@ func (translator *streamTranslator) consume(chunk completionResponse) ([]message
 	}
 
 	for _, delta := range choice.Delta.ToolCalls {
-		if delta.Index == nil || *delta.Index < 0 || *delta.Index >= maxToolCalls {
-			return nil, errors.New("upstream sent an invalid tool call index")
-		}
-		if delta.Type != "" && delta.Type != "function" {
-			return nil, errors.New("upstream sent an unsupported tool call type")
-		}
-		tool, exists := translator.tools[*delta.Index]
-		if !exists {
-			tool = &streamTool{}
-			translator.tools[*delta.Index] = tool
-		}
-		if tool.isStarted {
-			if delta.ID != "" && delta.ID != tool.id || delta.Function.Name != "" && delta.Function.Name != tool.name {
-				return nil, errors.New("upstream changed tool metadata after argument streaming began")
-			}
-		} else {
-			tool.id += delta.ID
-			tool.name += delta.Function.Name
-			if len(tool.id) > 256 || len(tool.name) > 64 {
-				return nil, errors.New("upstream tool metadata exceeds the supported limits")
-			}
-		}
-
-		if tool.arguments.Len()+len(delta.Function.Arguments) > maxToolArguments {
-			return nil, errors.New("upstream tool arguments exceed 8 MiB")
-		}
-		tool.arguments.WriteString(delta.Function.Arguments)
-		if tool.isStarted {
-			if delta.Function.Arguments != "" {
-				events = append(events, argumentEvent(tool.contentIndex, delta.Function.Arguments))
-			}
-		} else if translator.activeTool == nil && tool.id != "" &&
-			translator.declaredTools[tool.name] && tool.arguments.Len() > 0 {
-			if err := translator.startTool(tool, &events); err != nil {
-				return nil, err
-			}
+		if err := translator.addToolDelta(delta, &events); err != nil {
+			return nil, err
 		}
 	}
 
@@ -124,6 +91,57 @@ func (translator *streamTranslator) consume(chunk completionResponse) ([]message
 		translator.finishReason = *choice.FinishReason
 	}
 	return events, nil
+}
+
+// addToolDelta merges one tool call fragment. The first tool starts as soon as
+// its metadata and first arguments are complete. Other tools stay buffered.
+func (translator *streamTranslator) addToolDelta(
+	delta toolCallDelta, events *[]messageEvent,
+) error {
+	if delta.Index == nil || *delta.Index < 0 || *delta.Index >= maxToolCalls {
+		return errors.New("upstream sent an invalid tool call index")
+	}
+	if delta.Type != "" && delta.Type != "function" {
+		return errors.New("upstream sent an unsupported tool call type")
+	}
+	tool, exists := translator.tools[*delta.Index]
+	if !exists {
+		tool = &streamTool{}
+		translator.tools[*delta.Index] = tool
+	}
+
+	// Metadata can arrive in fragments until the tool block has started.
+	if tool.isStarted {
+		hasChangedID := delta.ID != "" && delta.ID != tool.id
+		hasChangedName := delta.Function.Name != "" && delta.Function.Name != tool.name
+		if hasChangedID || hasChangedName {
+			return errors.New("upstream changed tool metadata after argument streaming began")
+		}
+	} else {
+		tool.id += delta.ID
+		tool.name += delta.Function.Name
+		if len(tool.id) > maxIDBytes || len(tool.name) > maxToolNameBytes {
+			return errors.New("upstream tool metadata exceeds the supported limits")
+		}
+	}
+
+	if tool.arguments.Len()+len(delta.Function.Arguments) > maxToolArguments {
+		return errors.New("upstream tool arguments exceed 8 MiB")
+	}
+	tool.arguments.WriteString(delta.Function.Arguments)
+
+	if tool.isStarted {
+		if delta.Function.Arguments != "" {
+			*events = append(*events, argumentEvent(tool.contentIndex, delta.Function.Arguments))
+		}
+		return nil
+	}
+	canStart := translator.activeTool == nil && tool.id != "" &&
+		translator.declaredTools[tool.name] && tool.arguments.Len() > 0
+	if canStart {
+		return translator.startTool(tool, events)
+	}
+	return nil
 }
 
 func (translator *streamTranslator) addText(text string, events *[]messageEvent) error {
@@ -143,7 +161,8 @@ func (translator *streamTranslator) addText(text string, events *[]messageEvent)
 		translator.textIndex = index
 		empty := ""
 		*events = append(*events, messageEvent{
-			Type: "content_block_start", Index: &index, ContentBlock: &outputBlock{Type: "text", Text: &empty},
+			Type: "content_block_start", Index: &index,
+			ContentBlock: &outputBlock{Type: "text", Text: &empty},
 		})
 	}
 	index := translator.textIndex
@@ -165,10 +184,10 @@ func (translator *streamTranslator) openBlock() (int, error) {
 
 func (translator *streamTranslator) startTool(tool *streamTool, events *[]messageEvent) error {
 	if translator.textIndex >= 0 {
-		index := translator.textIndex
-		*events = append(*events, messageEvent{Type: "content_block_stop", Index: &index})
+		*events = append(*events, blockStopEvent(translator.textIndex))
 		translator.textIndex = -1
 	}
+
 	index, err := translator.openBlock()
 	if err != nil {
 		return err
@@ -178,7 +197,9 @@ func (translator *streamTranslator) startTool(tool *streamTool, events *[]messag
 	translator.activeTool = tool
 	*events = append(*events, messageEvent{
 		Type: "content_block_start", Index: &index,
-		ContentBlock: &outputBlock{Type: "tool_use", ID: tool.id, Name: tool.name, Input: json.RawMessage("{}")},
+		ContentBlock: &outputBlock{
+			Type: "tool_use", ID: tool.id, Name: tool.name, Input: json.RawMessage("{}"),
+		},
 	})
 	if tool.arguments.Len() > 0 {
 		*events = append(*events, argumentEvent(index, tool.arguments.String()))
@@ -193,6 +214,10 @@ func argumentEvent(index int, arguments string) messageEvent {
 	}
 }
 
+func blockStopEvent(index int) messageEvent {
+	return messageEvent{Type: "content_block_stop", Index: &index}
+}
+
 func (translator *streamTranslator) finish() ([]messageEvent, error) {
 	if translator.finishReason == "" {
 		return nil, errors.New("upstream stream ended before a finish reason")
@@ -204,38 +229,20 @@ func (translator *streamTranslator) finish() ([]messageEvent, error) {
 		return nil, err
 	}
 
-	seenIDs := make(map[string]bool)
-	// Validate every tool before closing any tool block. An interrupted or
-	// malformed argument object must not become an executable tool call.
-	for _, tool := range translator.tools {
-		if tool.id == "" || !translator.declaredTools[tool.name] || seenIDs[tool.id] {
-			return nil, errors.New("upstream returned invalid or undeclared tool metadata")
-		}
-		if _, err := toolArguments(tool.arguments.String()); err != nil {
-			return nil, err
-		}
-		seenIDs[tool.id] = true
+	if err := translator.validateTools(); err != nil {
+		return nil, err
 	}
 
 	var events []messageEvent
 	if translator.activeTool != nil {
-		index := translator.activeTool.contentIndex
-		events = append(events, messageEvent{Type: "content_block_stop", Index: &index})
+		events = append(events, blockStopEvent(translator.activeTool.contentIndex))
 		translator.activeTool = nil
 	}
-
-	// Replay buffered parallel tools as complete, sequential content blocks.
-	for upstreamIndex := 0; upstreamIndex < maxToolCalls; upstreamIndex++ {
-		tool, exists := translator.tools[upstreamIndex]
-		if exists && !tool.isStarted {
-			if err := translator.startTool(tool, &events); err != nil {
-				return nil, err
-			}
-			index := tool.contentIndex
-			events = append(events, messageEvent{Type: "content_block_stop", Index: &index})
-			translator.activeTool = nil
-		}
+	if err := translator.replayBufferedTools(&events); err != nil {
+		return nil, err
 	}
+
+	// Text that arrived after the tools follows them as a new block.
 	if translator.trailingText.Len() > 0 {
 		if err := translator.addText(translator.trailingText.String(), &events); err != nil {
 			return nil, err
@@ -247,19 +254,51 @@ func (translator *streamTranslator) finish() ([]messageEvent, error) {
 		}
 	}
 	if translator.textIndex >= 0 {
-		index := translator.textIndex
-		events = append(events, messageEvent{Type: "content_block_stop", Index: &index})
+		events = append(events, blockStopEvent(translator.textIndex))
 		translator.textIndex = -1
 	}
 
 	events = append(events,
 		messageEvent{
-			Type: "message_delta", Delta: map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
+			Type:  "message_delta",
+			Delta: map[string]any{"stop_reason": stopReason, "stop_sequence": nil},
 			Usage: &translator.usage,
 		},
 		messageEvent{Type: "message_stop"},
 	)
 	return events, nil
+}
+
+// validateTools checks every tool before any tool block closes. An interrupted
+// or malformed argument object must not become an executable tool call.
+func (translator *streamTranslator) validateTools() error {
+	seenIDs := make(map[string]bool)
+	for _, tool := range translator.tools {
+		if tool.id == "" || !translator.declaredTools[tool.name] || seenIDs[tool.id] {
+			return errors.New("upstream returned invalid or undeclared tool metadata")
+		}
+		if _, err := toolArguments(tool.arguments.String()); err != nil {
+			return err
+		}
+		seenIDs[tool.id] = true
+	}
+	return nil
+}
+
+// replayBufferedTools emits parallel tools as complete, sequential content blocks.
+func (translator *streamTranslator) replayBufferedTools(events *[]messageEvent) error {
+	for upstreamIndex := 0; upstreamIndex < maxToolCalls; upstreamIndex++ {
+		tool, exists := translator.tools[upstreamIndex]
+		if !exists || tool.isStarted {
+			continue
+		}
+		if err := translator.startTool(tool, events); err != nil {
+			return err
+		}
+		*events = append(*events, blockStopEvent(tool.contentIndex))
+		translator.activeTool = nil
+	}
+	return nil
 }
 
 type sseFrame struct {

@@ -45,17 +45,24 @@ func run(arguments []string) int {
 		}
 		return 0
 	}
+	return runProxy(cfg)
+}
 
+// runProxy serves until a signal or a listener failure, and returns the exit code.
+func runProxy(cfg config) int {
 	application := newProxy(cfg)
 	defer application.client.CloseIdleConnections()
-	if cfg.authMode == "chatgpt" {
-		application.oauth, err = openOAuthSession(cfg, application.client)
+	if cfg.usesChatGPT() {
+		session, err := openOAuthSession(cfg, application.client)
 		if err != nil {
 			slog.Error("could not load ChatGPT session", "reason", err.Error())
 			return 1
 		}
+		application.oauth = session
 		defer func() {
-			cleanupContext, cancelCleanup := context.WithTimeout(context.Background(), 5*time.Second)
+			cleanupContext, cancelCleanup := context.WithTimeout(
+				context.Background(), 5*time.Second,
+			)
 			defer cancelCleanup()
 			if err := application.oauth.close(cleanupContext); err != nil {
 				slog.Warn("could not remove credential lock", "reason", err.Error())
@@ -83,7 +90,9 @@ func run(arguments []string) int {
 		BaseContext:    func(net.Listener) context.Context { return requestContext },
 	}
 
-	stopContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	stopContext, stopSignals := signal.NotifyContext(
+		context.Background(), os.Interrupt, syscall.SIGTERM,
+	)
 	defer stopSignals()
 
 	// All listeners share one server, so the proxy key and limits cover every address.

@@ -9,6 +9,8 @@ func translateResponse(
 	response completionResponse, request messagesRequest, messageID string,
 ) (messageResponse, error) {
 	result := newMessage(request.Model, messageID)
+
+	// The reply must have the shape of one complete assistant message.
 	if hasValue(response.Error) || len(response.Choices) != 1 || response.Choices[0].Index != 0 {
 		return result, errors.New("upstream must return exactly one completion choice")
 	}
@@ -21,7 +23,8 @@ func translateResponse(
 	}
 
 	if choice.Message.Content != nil && *choice.Message.Content != "" {
-		result.Content = append(result.Content, outputBlock{Type: "text", Text: choice.Message.Content})
+		result.Content = append(result.Content,
+			outputBlock{Type: "text", Text: choice.Message.Content})
 	}
 	if choice.Message.Refusal != "" {
 		refusal := choice.Message.Refusal
@@ -34,7 +37,8 @@ func translateResponse(
 	declaredTools := declaredToolNames(request.Tools)
 	seenIDs := make(map[string]bool)
 	for _, call := range choice.Message.ToolCalls {
-		if call.Type != "function" || call.ID == "" || len(call.ID) > 256 || seenIDs[call.ID] {
+		if call.Type != "function" || call.ID == "" || len(call.ID) > maxIDBytes ||
+			seenIDs[call.ID] {
 			return result, errors.New("upstream returned invalid or duplicate tool metadata")
 		}
 		if !declaredTools[call.Function.Name] {
@@ -50,7 +54,9 @@ func translateResponse(
 		})
 	}
 
-	stopReason, err := translateStopReason(*choice.FinishReason, len(seenIDs) > 0, choice.Message.Refusal != "")
+	stopReason, err := translateStopReason(
+		*choice.FinishReason, len(seenIDs) > 0, choice.Message.Refusal != "",
+	)
 	if err != nil {
 		return result, err
 	}
@@ -90,7 +96,8 @@ func toolArguments(arguments string) (json.RawMessage, error) {
 	}
 	raw := json.RawMessage(arguments)
 	if !isJSONObject(raw) || checkJSONDepth(raw) != nil {
-		return nil, errors.New("upstream tool arguments must be a complete JSON object within the nesting limit")
+		return nil, errors.New("upstream tool arguments must be a complete JSON object " +
+			"within the nesting limit")
 	}
 	return raw, nil
 }

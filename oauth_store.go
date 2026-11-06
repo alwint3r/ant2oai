@@ -15,7 +15,15 @@ import (
 	"time"
 )
 
-const maxCredentialFileBytes = 1 << 20
+const (
+	maxCredentialFileBytes = 1 << 20
+	maxOAuthAccounts       = 32
+	maxOAuthScopes         = 64
+	maxOAuthSecretBytes    = 64 << 10
+
+	// hostIDBytes is the size of "urn:uuid:" and a 36-character UUID.
+	hostIDBytes = 45
+)
 
 type oauthCredentials struct {
 	Issuer       string    `json:"issuer"`
@@ -36,6 +44,11 @@ func (credentials oauthCredentials) hasScope(wanted string) bool {
 		}
 	}
 	return false
+}
+
+// hasPlanUsage reports whether the grant permits inference through a ChatGPT plan.
+func (credentials oauthCredentials) hasPlanUsage() bool {
+	return credentials.hasScope(chatGPTScope) && credentials.hasScope("resource.invoke")
 }
 
 func (credentials oauthCredentials) withoutTokens() oauthCredentials {
@@ -84,6 +97,7 @@ func lockCredentials(path string) (*credentialLock, error) {
 	if err := os.MkdirAll(directory, 0700); err != nil {
 		return nil, fmt.Errorf("create credential directory: %w", err)
 	}
+
 	info, err := os.Stat(directory)
 	if err != nil {
 		return nil, fmt.Errorf("inspect credential directory: %w", err)
@@ -95,12 +109,14 @@ func lockCredentials(path string) (*credentialLock, error) {
 	lockPath := path + ".lock"
 	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
 	if errors.Is(err, os.ErrExist) {
-		return nil, errors.New("credential file is locked; stop the other proxy or login command. " +
+		return nil, errors.New("credential file is locked; " +
+			"stop the other proxy or login command. " +
 			"If it crashed, verify that it has stopped before removing the .lock file")
 	}
 	if err != nil {
 		return nil, fmt.Errorf("lock credentials: %w", err)
 	}
+
 	_, writeError := fmt.Fprintf(file, "pid=%d\n", os.Getpid())
 	closeError := file.Close()
 	if writeError != nil || closeError != nil {
@@ -117,6 +133,8 @@ func (lock *credentialLock) close() error {
 
 func readOAuthStore(path string) (oauthStore, error) {
 	var store oauthStore
+
+	// Check the path before opening it, then confirm that the same file opened.
 	before, err := os.Lstat(path)
 	if err != nil {
 		return store, err
@@ -139,7 +157,8 @@ func readOAuthStore(path string) (oauthStore, error) {
 
 	raw, err := io.ReadAll(io.LimitReader(file, maxCredentialFileBytes+1))
 	if err != nil || len(raw) > maxCredentialFileBytes || checkJSONDepth(raw) != nil {
-		return store, errors.New("credential file could not be read within its size and nesting limits")
+		return store, errors.New("credential file could not be read " +
+			"within its size and nesting limits")
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -147,15 +166,16 @@ func readOAuthStore(path string) (oauthStore, error) {
 	if decoder.Decode(&store) != nil || decoder.Decode(&trailing) != io.EOF {
 		return store, errors.New("credential file contains invalid or unsupported JSON")
 	}
-	if len(store.HostID) != 45 || !strings.HasPrefix(store.HostID, "urn:uuid:") ||
-		store.Accounts == nil || len(store.Accounts) > 32 {
+
+	if len(store.HostID) != hostIDBytes || !strings.HasPrefix(store.HostID, "urn:uuid:") ||
+		store.Accounts == nil || len(store.Accounts) > maxOAuthAccounts {
 		return store, errors.New("credential file contains invalid host or account data")
 	}
 	for _, account := range store.Accounts {
 		if account.Issuer != chatGPTIssuer || !validIssuedClientID(account.ClientID) ||
 			!validOAuthSecret(account.AccessToken) || !validOAuthSecret(account.RefreshToken) ||
-			!validOAuthSecret(account.IDToken) || len(account.Subject) > 256 ||
-			len(account.Scopes) > 64 {
+			!validOAuthSecret(account.IDToken) || len(account.Subject) > maxIDBytes ||
+			len(account.Scopes) > maxOAuthScopes {
 			return store, errors.New("credential file contains invalid registration or token data")
 		}
 		if account.AccessToken != "" && (account.Subject == "" || account.ExpiresAt.IsZero()) {
@@ -170,6 +190,8 @@ func newOAuthStore() (oauthStore, error) {
 	if _, err := rand.Read(identifier[:]); err != nil {
 		return oauthStore{}, errors.New("could not generate the OAuth host identifier")
 	}
+
+	// These bits mark a random, version 4 UUID.
 	identifier[6] = identifier[6]&0x0f | 0x40
 	identifier[8] = identifier[8]&0x3f | 0x80
 	text := hex.EncodeToString(identifier[:])
@@ -226,7 +248,7 @@ func writeOAuthStore(path string, store oauthStore) error {
 }
 
 func validIssuedClientID(value string) bool {
-	if value == "" || value == "dynamic_agent_client" || len(value) > 256 {
+	if value == "" || value == "dynamic_agent_client" || len(value) > maxIDBytes {
 		return false
 	}
 	for _, character := range []byte(value) {
@@ -238,7 +260,7 @@ func validIssuedClientID(value string) bool {
 }
 
 func validOAuthSecret(value string) bool {
-	if len(value) > 64<<10 {
+	if len(value) > maxOAuthSecretBytes {
 		return false
 	}
 	for _, character := range []byte(value) {
