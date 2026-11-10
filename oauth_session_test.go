@@ -619,8 +619,8 @@ func TestSessionCloseRetainsLockDuringRefresh(t *testing.T) {
 	expired, cancel := context.WithCancel(context.Background())
 	cancel()
 	err = session.close(expired)
-	assertError(t, err, "credential renewal is still active; the lock was retained. "+
-		"Verify this process has stopped before removing the .lock file")
+	assertError(t, err, "credential renewal is still active; "+
+		"the credential lock is kept until this process exits")
 	if _, err := os.Stat(session.path + ".lock"); err != nil {
 		t.Errorf("lock file: %v, want retained", err)
 	}

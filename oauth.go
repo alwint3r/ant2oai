@@ -19,7 +19,6 @@ import (
 	"sort"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -65,7 +64,7 @@ func runAuthCommand(command string, cfg config, output io.Writer) error {
 		return fmt.Errorf("load ChatGPT credentials: %w", err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), shutdownSignals()...)
 	defer stop()
 	ctx, cancel := context.WithTimeout(ctx, authCommandTimeout)
 	defer cancel()

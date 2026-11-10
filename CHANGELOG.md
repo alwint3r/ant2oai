@@ -35,6 +35,13 @@ contract described in `README.md`; there is no earlier release to migrate from.
   Raw request data and provider errors remain excluded. Give `safeguards`
   rejections an explicit server-side auto-mode compatibility hint, and document
   client-side classifier routing and safety limits.
+- Lock the ChatGPT credential file with `flock(2)` on macOS, Linux, and the
+  BSDs. The kernel releases the lock when the process exits, so a `.lock` file
+  left by a killed or crashed process no longer blocks `serve` or `login`. A
+  normal exit still removes the file. Other platforms keep the
+  exclusive-creation lock file. The proxy and the login commands also shut down
+  gracefully on `SIGHUP`, which a terminal sends when it closes, unless the
+  process started with `SIGHUP` ignored.
 - Document Claude Code traffic outside `ANTHROPIC_BASE_URL`, telemetry and
   feedback controls, automatic-update effects, the WebFetch safety-check
   exception, and process-level outbound network restrictions.

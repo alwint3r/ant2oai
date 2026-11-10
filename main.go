@@ -90,9 +90,7 @@ func runProxy(cfg config) int {
 		BaseContext:    func(net.Listener) context.Context { return requestContext },
 	}
 
-	stopContext, stopSignals := signal.NotifyContext(
-		context.Background(), os.Interrupt, syscall.SIGTERM,
-	)
+	stopContext, stopSignals := signal.NotifyContext(context.Background(), shutdownSignals()...)
 	defer stopSignals()
 
 	// All listeners share one server, so the proxy key and limits cover every address.
@@ -133,6 +131,17 @@ func runProxy(cfg config) int {
 		}
 	}
 	return exitCode
+}
+
+// shutdownSignals lists the signals that start a graceful shutdown. A terminal
+// sends SIGHUP when it closes. SIGHUP is left out when the process started with
+// it ignored, for example under nohup, because Notify would stop ignoring it.
+func shutdownSignals() []os.Signal {
+	signals := []os.Signal{os.Interrupt, syscall.SIGTERM}
+	if !signal.Ignored(syscall.SIGHUP) {
+		signals = append(signals, syscall.SIGHUP)
+	}
+	return signals
 }
 
 // openListeners opens every address or none, so a failed start keeps no port bound.

@@ -296,8 +296,9 @@ func TestCredentialLock(t *testing.T) {
 	}
 
 	_, err = lockCredentials(path)
-	assertError(t, err, "credential file is locked; stop the other proxy or login command. "+
-		"If it crashed, verify that it has stopped before removing the .lock file")
+	if !errors.Is(err, errCredentialsLocked) {
+		t.Fatalf("second lock: %v, want %v", err, errCredentialsLocked)
+	}
 
 	if err := lock.close(); err != nil {
 		t.Fatalf("release: %v", err)

@@ -86,12 +86,14 @@ func credentialPath(cfg config) (string, error) {
 	return filepath.Join(directory, "ant2oai", "chatgpt.json"), nil
 }
 
-type credentialLock struct {
-	path string
-}
+// errCredentialsLocked reports that another process holds the credential lock.
+var errCredentialsLocked = errors.New("credential file is locked; " +
+	"stop the other proxy or login command")
 
 // Hold this lock for the entire login command or proxy lifetime. Rotating
 // refresh tokens must have exactly one process writing the credential file.
+// The platform-specific acquireCredentialLock decides how the lock behaves
+// after a crash.
 func lockCredentials(path string) (*credentialLock, error) {
 	directory := filepath.Dir(path)
 	if err := os.MkdirAll(directory, 0700); err != nil {
@@ -106,29 +108,7 @@ func lockCredentials(path string) (*credentialLock, error) {
 		return nil, errors.New("credential directory must not be writable by other users")
 	}
 
-	lockPath := path + ".lock"
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
-	if errors.Is(err, os.ErrExist) {
-		return nil, errors.New("credential file is locked; " +
-			"stop the other proxy or login command. " +
-			"If it crashed, verify that it has stopped before removing the .lock file")
-	}
-	if err != nil {
-		return nil, fmt.Errorf("lock credentials: %w", err)
-	}
-
-	_, writeError := fmt.Fprintf(file, "pid=%d\n", os.Getpid())
-	closeError := file.Close()
-	if writeError != nil || closeError != nil {
-		removeError := os.Remove(lockPath)
-		return nil, fmt.Errorf("write credential lock: %w",
-			errors.Join(writeError, closeError, removeError))
-	}
-	return &credentialLock{path: lockPath}, nil
-}
-
-func (lock *credentialLock) close() error {
-	return os.Remove(lock.path)
+	return acquireCredentialLock(path + ".lock")
 }
 
 func readOAuthStore(path string) (oauthStore, error) {

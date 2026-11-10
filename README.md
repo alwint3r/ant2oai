@@ -125,8 +125,12 @@ operation; atomic replacement and directory-entry durability are not guaranteed.
 
 A `<auth-file>.lock` file allows one proxy or credential-writing command at a
 time. Stop the proxy before `login`, `logout`, or `models`; `login-status` can
-run while it is serving. After a crash, verify the old process has stopped
-before removing its stale `.lock` file. Logout attempts to revoke the refresh
+run while it is serving. On macOS, Linux, and the BSDs, the process holds an
+`flock(2)` lock on this file, and the kernel releases the lock when the process
+exits for any reason. Therefore a `.lock` file left by a killed or crashed
+process does not block the next start. On other platforms, including Windows,
+only the file's existence locks the credentials. After a crash there, verify the
+old process has stopped before removing its stale `.lock` file. Logout attempts to revoke the refresh
 token, or the access token when no refresh token is saved. It clears local
 tokens and retains the host ID and account/client mapping. If remote revocation
 is unconfirmed, disconnect the app in ChatGPT Settings.
@@ -563,11 +567,12 @@ and the first tool's arguments are forwarded immediately. Arguments for other
 parallel calls and any text after tool use are buffered until the upstream
 finishes. This keeps downstream content blocks sequential for Anthropic SDK
 callbacks. All tool arguments are retained for validation within the limits
-above. A downstream disconnect cancels the upstream request. `SIGINT` and
-`SIGTERM` allow active requests 15 seconds to finish, then cancel them. OAuth
-renewal gets up to five extra seconds to finish credential writes. If it cannot
-finish, the process retains its lock file; verify the process has stopped
-before removing that stale lock.
+above. A downstream disconnect cancels the upstream request. `SIGINT`,
+`SIGTERM`, and `SIGHUP` allow active requests 15 seconds to finish, then cancel
+them. A terminal sends `SIGHUP` when it closes. A process started with `SIGHUP`
+ignored, for example under `nohup`, keeps ignoring it. OAuth renewal gets up to
+five extra seconds to finish credential writes. If it cannot finish, the
+process keeps its credential lock until it exits.
 
 ### Claude Code traffic outside the proxy
 
@@ -690,7 +695,7 @@ conversation history that excludes those blocks.
 | Local HTTP 401 | Use the proxy token as `ANTHROPIC_AUTH_TOKEN`; check `/status` for settings overrides |
 | Upstream authentication failure | In API-key mode, check `OPENAI_API_KEY`; in ChatGPT mode, check `login-status`, plan scopes, and workspace policy |
 | ChatGPT sign-in succeeds but plan usage is disabled | Stop the proxy and run `login -reconsent`; check OpenAI eligibility and ChatGPT app permissions |
-| Credential file is locked | Stop the process using it; remove a stale `.lock` only after verifying that process has stopped |
+| Credential file is locked | Stop the process using it. On platforms without `flock(2)`, remove a stale `.lock` only after verifying that process has stopped |
 | ChatGPT HTTP 403 or 429 | Check the safe upstream error code and ChatGPT Settings → Usage; an app-specific restriction or limit can apply |
 | Upstream endpoint/model missing | Check the `/v1` or other API prefix in `OPENAI_BASE_URL`, then the selected model |
 | Upstream rejects the request | Check tool support, model output/context limits, token-limit field, and sampling restrictions |

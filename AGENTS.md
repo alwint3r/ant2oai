@@ -53,7 +53,8 @@ Completions wire types. `translate_request.go`, `translate_response.go`, and
 ChatGPT Responses protocol. Stream translators accept parsed chunks or events
 independently of network I/O. `oauth.go` owns login commands, `oauth_oidc.go`
 verifies ID tokens, `oauth_session.go` owns token renewal, and `oauth_store.go`
-owns protected credential files and process locks. OAuth tokens must only go to
+owns protected credential files and process locks. `oauth_lock_flock.go` and
+`oauth_lock_exclusive.go` implement the lock file for each platform. OAuth tokens must only go to
 the discovered OpenAI auth endpoints and https://api.openai.com/v1.
 JSON configuration may store a local proxy key in `proxy_api_key`. Such files
 are local secret stores and require owner-only permissions on Unix. Keep real

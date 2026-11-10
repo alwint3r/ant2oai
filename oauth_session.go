@@ -185,8 +185,8 @@ func openOAuthSession(cfg config, client *http.Client) (*oauthSession, error) {
 }
 
 // Stop new renewals before waiting for the current credential writer. If the
-// caller's cleanup deadline expires, retain the file lock so a second process
-// cannot write credentials while this process is still shutting down.
+// caller's cleanup deadline expires, keep the lock until the process exits, so
+// a second process cannot write credentials while this process is shutting down.
 func (session *oauthSession) close(ctx context.Context) error {
 	session.mutex.Lock()
 	session.isClosed = true
@@ -197,8 +197,8 @@ func (session *oauthSession) close(ctx context.Context) error {
 		select {
 		case <-pending.done:
 		case <-ctx.Done():
-			return errors.New("credential renewal is still active; the lock was retained. " +
-				"Verify this process has stopped before removing the .lock file")
+			return errors.New("credential renewal is still active; " +
+				"the credential lock is kept until this process exits")
 		}
 	}
 	return session.lock.close()
